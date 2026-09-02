@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         yt-dlp for Violentmonkey
 // @namespace    local.vm-yt-dlp
-// @version      1.5.0
+// @version      1.5.1
 // @description  A secure, native-feeling YouTube download panel powered by your local yt-dlp.
 // @license      MIT
 // @match        https://www.youtube.com/*
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.5.0';
+  const VERSION = '1.5.1';
   const BOOTSTRAP_TOKEN = '__VM_YTDLP_TOKEN__';
   const BOOTSTRAP_API_BASE = '__VM_YTDLP_API_BASE__';
   const STORAGE_KEY = 'vmYtDlp.settings.v1';
@@ -146,6 +146,7 @@
   let connectionBadge;
   let queueBadge;
   let toastRack;
+  let languageDisplayNames = null;
 
   function h(value) {
     return String(value ?? '')
@@ -855,6 +856,7 @@
     }
     if (!force && state.info && state.infoUrl === url) return;
     if (state.infoLoading) return;
+    const previousInfoUrl = state.infoUrl;
     state.infoLoading = true;
     state.infoError = null;
     if (state.tab === 'download') renderDownload();
@@ -866,6 +868,11 @@
         proxy_url: proxyPayload(),
         allow_invalid_certificates: state.settings.allowInvalidCertificates === true,
       });
+      if (previousInfoUrl !== url) {
+        state.form.exactFormatId = '';
+        state.form.mergeVideoFormatId = '';
+        state.form.mergeAudioFormatId = '';
+      }
       state.info = response.info;
       state.infoUrl = url;
       state.connection = 'ready';
@@ -886,8 +893,48 @@
     return state.form.downloadMode === 'audio' ? 'audio' : 'video';
   }
 
+  function audioLanguageLabel(format) {
+    const code = String(format?.language || '').trim();
+    if (!code) return 'Language unknown';
+    let display = '';
+    try {
+      if (!languageDisplayNames && typeof Intl.DisplayNames === 'function') {
+        const locales = Array.isArray(navigator.languages) && navigator.languages.length ? navigator.languages : ['en'];
+        languageDisplayNames = new Intl.DisplayNames(locales, { type: 'language' });
+      }
+      display = languageDisplayNames?.of(code) || '';
+    } catch (_) {
+      try {
+        const baseCode = code.split(/[-_]/)[0];
+        display = baseCode && languageDisplayNames ? languageDisplayNames.of(baseCode) || '' : '';
+      } catch (_) {
+        display = '';
+      }
+    }
+    if (!display || display.toLowerCase() === code.toLowerCase()) return code;
+    return `${display} (${code})`;
+  }
+
+  function audioPreferenceLabel(format) {
+    const preference = Number(format?.language_preference);
+    const note = String(format?.format_note || '');
+    if (/\boriginal\b/i.test(note)) return 'Original';
+    if (/\bdefault\b/i.test(note) || (Number.isFinite(preference) && preference > 0)) return 'Default';
+    return '';
+  }
+
+  function audioPreferenceScore(format) {
+    const rawPreference = Number(format?.language_preference);
+    let score = Number.isFinite(rawPreference) ? rawPreference : 0;
+    const note = String(format?.format_note || '').toLowerCase();
+    if (/\boriginal\b/.test(note)) score += 200;
+    else if (/\bdefault\b/.test(note)) score += 100;
+    if (/\bdub(?:bed)?\b/.test(note)) score -= 100;
+    return score;
+  }
+
   function sortedFormats(mediaType = activeMediaType()) {
-    const formats = [...(state.info?.formats || [])].filter((format) => {
+    const candidates = [...(state.info?.formats || [])].filter((format) => {
       if (mediaType === 'audio') {
         return state.form.downloadMode === 'merge'
           ? format.has_audio && !format.has_video
@@ -898,11 +945,18 @@
       }
       return format.has_video;
     });
+    let formats = candidates;
+    if (mediaType === 'audio' && state.form.downloadMode === 'audio') {
+      const audioOnlyFormats = candidates.filter((format) => !format.has_video);
+      if (audioOnlyFormats.length) formats = audioOnlyFormats;
+    }
     formats.sort((a, b) => {
       if (mediaType === 'video') {
         return (Number(b.height) - Number(a.height)) || (Number(b.fps) - Number(a.fps)) || (Number(b.tbr) - Number(a.tbr));
       }
-      return (Number(b.abr) - Number(a.abr)) || (Number(b.tbr) - Number(a.tbr));
+      return (audioPreferenceScore(b) - audioPreferenceScore(a))
+        || (Number(b.abr) - Number(a.abr))
+        || (Number(b.tbr) - Number(a.tbr));
     });
     return formats;
   }
@@ -935,13 +989,23 @@
       return `${format.format_id} · ${resolution}${fps} · ${format.ext}${audio}${sizeText}`;
     }
     const bitrate = format.abr || format.tbr;
-    return `${format.format_id} · ${bitrate ? `${Math.round(bitrate)}k · ` : ''}${format.ext} · ${format.acodec}${sizeText}`;
+    const language = audioLanguageLabel(format);
+    const preference = audioPreferenceLabel(format);
+    const preferred = preference ? ` · ${preference}` : '';
+    const channels = format.audio_channels ? ` · ${format.audio_channels}ch` : '';
+    const note = String(format.format_note || '').trim();
+    const noteText = note && !/\b(?:original|default)\b/i.test(note) ? ` · ${note}` : '';
+    return `${format.format_id} · ${language}${preferred} · ${bitrate ? `${Math.round(bitrate)}k · ` : ''}${format.ext} · ${format.acodec}${channels}${noteText}${sizeText}`;
   }
 
   function formatMeta(format) {
     if (!format) return '';
     const size = format.filesize || format.filesize_approx;
-    return `<div class="vm-format-meta"><span class="vm-chip">${h(format.vcodec)}</span><span class="vm-chip">${h(format.acodec)}</span><span class="vm-chip">${h(format.protocol)}</span>${size ? `<span class="vm-chip">${formatBytes(size)}</span>` : ''}</div>`;
+    const language = format.has_audio ? `<span class="vm-chip">${h(audioLanguageLabel(format))}</span>` : '';
+    const preference = format.has_audio ? audioPreferenceLabel(format) : '';
+    const preferred = preference ? `<span class="vm-chip">${h(preference)}</span>` : '';
+    const channels = format.audio_channels ? `<span class="vm-chip">${h(format.audio_channels)} channels</span>` : '';
+    return `<div class="vm-format-meta"><span class="vm-chip">${h(format.vcodec)}</span><span class="vm-chip">${h(format.acodec)}</span>${language}${preferred}${channels}<span class="vm-chip">${h(format.protocol)}</span>${size ? `<span class="vm-chip">${formatBytes(size)}</span>` : ''}</div>`;
   }
 
   function renderDownload() {
@@ -1027,30 +1091,35 @@
               ${formatMeta(selectedMergeVideo)}
             </label>
             <label class="vm-field full">
-              <span class="vm-label">Audio stream <span>audio only</span></span>
+              <span class="vm-label">Audio stream <span>audio only · language shown</span></span>
               <select class="vm-select" data-field="mergeAudioFormatId" ${mergeAudioFormats.length ? '' : 'disabled'}>${mergeAudioOptions || '<option value="">No audio-only stream available</option>'}</select>
               ${formatMeta(selectedMergeAudio)}
             </label>` : `
-            <label class="vm-field">
-              <span class="vm-label">Selection</span>
-              <select class="vm-select" data-field="selectionType">
-                <option value="preset" ${state.form.selectionType === 'preset' ? 'selected' : ''}>Smart quality</option>
-                <option value="exact" ${state.form.selectionType === 'exact' ? 'selected' : ''}>Exact yt-dlp format</option>
-              </select>
-            </label>
-            ${state.form.selectionType === 'preset' ? `
+            ${isAudioMode ? `
+              <label class="vm-field full">
+                <span class="vm-label">Audio stream <span>${formats.length} tracks · language shown</span></span>
+                <select class="vm-select" data-field="exactFormatId" ${formats.length ? '' : 'disabled'}>${exactOptions || '<option value="">No audio stream available</option>'}</select>
+                ${formatMeta(selectedFormat)}
+              </label>` : `
               <label class="vm-field">
-                <span class="vm-label">${isAudioMode ? 'Source audio' : 'Maximum resolution'}</span>
-                ${!isAudioMode ? `
-                  <select class="vm-select" data-field="preset">
-                    ${[['best','Best available'],['4320','Up to 8K'],['2160','Up to 4K'],['1440','Up to 1440p'],['1080','Up to 1080p'],['720','Up to 720p'],['480','Up to 480p'],['360','Up to 360p'],['240','Up to 240p'],['144','Up to 144p']].map(([value,label]) => `<option value="${value}" ${String(state.form.preset) === value ? 'selected' : ''}>${label}</option>`).join('')}
-                  </select>` : `<div class="vm-input" style="display:flex;align-items:center;color:#a9abb4">Best available audio</div>`}
+                <span class="vm-label">Selection</span>
+                <select class="vm-select" data-field="selectionType">
+                  <option value="preset" ${state.form.selectionType === 'preset' ? 'selected' : ''}>Smart quality</option>
+                  <option value="exact" ${state.form.selectionType === 'exact' ? 'selected' : ''}>Exact yt-dlp format</option>
+                </select>
+              </label>
+              ${state.form.selectionType === 'preset' ? `
+              <label class="vm-field">
+                <span class="vm-label">Maximum resolution</span>
+                <select class="vm-select" data-field="preset">
+                  ${[['best','Best available'],['4320','Up to 8K'],['2160','Up to 4K'],['1440','Up to 1440p'],['1080','Up to 1080p'],['720','Up to 720p'],['480','Up to 480p'],['360','Up to 360p'],['240','Up to 240p'],['144','Up to 144p']].map(([value,label]) => `<option value="${value}" ${String(state.form.preset) === value ? 'selected' : ''}>${label}</option>`).join('')}
+                </select>
               </label>` : `
               <label class="vm-field full">
                 <span class="vm-label">Exact stream <span>${formats.length} available</span></span>
                 <select class="vm-select" data-field="exactFormatId">${exactOptions}</select>
                 ${formatMeta(selectedFormat)}
-              </label>`}`}
+              </label>`}`}`}
 
           ${!isAudioMode ? `
             <label class="vm-field full">
@@ -1161,7 +1230,7 @@
       input.addEventListener('change', () => {
         const field = input.dataset.field;
         state.form[field] = input.type === 'checkbox' ? input.checked : input.value;
-        if (field === 'selectionType' || field === 'audioCodec' || field === 'subtitleMode' || field === 'writeThumbnail' || field === 'embedThumbnail' || field === 'mergeVideoFormatId' || field === 'mergeAudioFormatId') {
+        if (field === 'selectionType' || field === 'exactFormatId' || field === 'audioCodec' || field === 'subtitleMode' || field === 'writeThumbnail' || field === 'embedThumbnail' || field === 'mergeVideoFormatId' || field === 'mergeAudioFormatId') {
           ensureExactFormat();
           renderDownload();
         }
@@ -1184,8 +1253,8 @@
       toast('Choose both a video-only stream and an audio-only stream.', true);
       return;
     }
-    if (!isMergeMode && state.form.selectionType === 'exact' && !format) {
-      toast('Select a valid exact format.', true);
+    if (!isMergeMode && (state.form.downloadMode === 'audio' || state.form.selectionType === 'exact') && !format) {
+      toast(state.form.downloadMode === 'audio' ? 'Select a valid audio stream.' : 'Select a valid exact format.', true);
       return;
     }
     if (state.form.downloadMode === 'video' && state.form.selectionType === 'exact' && format?.has_audio) {
@@ -1209,9 +1278,11 @@
       download_mode: state.form.downloadMode,
       selection: isMergeMode
         ? { type: 'streams', video_format_id: mergeVideoFormat.format_id, audio_format_id: mergeAudioFormat.format_id }
-        : state.form.selectionType === 'preset'
-          ? { type: 'preset', preset: state.form.downloadMode === 'audio' ? 'best' : state.form.preset }
-          : { type: 'exact', format_id: format.format_id, has_video: format.has_video, has_audio: format.has_audio },
+        : state.form.downloadMode === 'audio'
+          ? { type: 'exact', format_id: format.format_id, has_video: format.has_video, has_audio: format.has_audio }
+          : state.form.selectionType === 'preset'
+            ? { type: 'preset', preset: state.form.preset }
+            : { type: 'exact', format_id: format.format_id, has_video: format.has_video, has_audio: format.has_audio },
       container: state.form.container,
       audio_codec: state.form.audioCodec,
       audio_quality: state.form.audioQuality,

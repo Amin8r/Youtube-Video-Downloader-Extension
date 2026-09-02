@@ -18,7 +18,7 @@ const requiredFragments = [
   '// @grant        GM_setValue',
   '// @grant        GM_addElement',
   '// @inject-into  content',
-  '// @version      1.5.0',
+  '// @version      1.5.1',
   "attachShadow({ mode: 'closed' })",
   "document.implementation.createHTMLDocument('yt-dlp UI')",
   'replaceMarkup(shadow, `',
@@ -52,6 +52,16 @@ const requiredFragments = [
   'Merge sources',
   'Video stream',
   'Audio stream',
+  'function audioLanguageLabel(format)',
+  'new Intl.DisplayNames(locales, { type: \'language\' })',
+  'function audioPreferenceLabel(format)',
+  'function audioPreferenceScore(format)',
+  'format?.language_preference',
+  "return 'Original'",
+  "return 'Default'",
+  'Language unknown',
+  'tracks · language shown',
+  "state.form.downloadMode === 'audio'\n          ? { type: 'exact'",
   'Automatic job retries',
   'Attempt ${attempt}/${maxAttempts}',
   "proxyUrl: 'socks5://127.0.0.1:1080'",
@@ -105,6 +115,11 @@ if ((source.match(/__VM_YTDLP_TOKEN__/g) || []).length !== 1) {
   console.error('Userscript contract failed: token placeholder count changed unexpectedly.');
   process.exit(1);
 }
+if ((source.match(/let languageDisplayNames = null;/g) || []).length !== 1
+    || source.indexOf('let languageDisplayNames = null;') > source.indexOf('function apiRequest(')) {
+  console.error('Userscript contract failed: the audio language-name cache is not in module scope.');
+  process.exit(1);
+}
 
 for (const setting of ['proxyEnabled', 'allowInvalidCertificates', 'cookieEnabled', 'notifications']) {
   const inputIndex = source.indexOf(`data-setting="${setting}"`);
@@ -117,4 +132,38 @@ for (const setting of ['proxyEnabled', 'allowInvalidCertificates', 'cookieEnable
   }
 }
 
-console.log('Userscript metadata, pairing, retry, persistent resume, shortcut isolation, fullscreen visibility, three-mode, proxy, TLS bypass, safe-rendering, and diagnostic contracts are present.');
+const helperStart = source.indexOf('function audioLanguageLabel(format)');
+const helperEnd = source.indexOf('function sortedFormats(', helperStart);
+if (helperStart < 0 || helperEnd <= helperStart) {
+  console.error('Userscript contract failed: audio-language helpers could not be isolated.');
+  process.exit(1);
+}
+const helperSource = source.slice(helperStart, helperEnd);
+const helpers = new Function(
+  'navigator',
+  `let languageDisplayNames = null; ${helperSource}; return { audioLanguageLabel, audioPreferenceLabel, audioPreferenceScore };`,
+)({ languages: ['en'] });
+const originalAudio = { language: 'en', language_preference: 10, format_note: 'English (original)', abr: 128 };
+const hindiDub = { language: 'hi', language_preference: -1, format_note: 'Hindi dubbed', abr: 192 };
+if (helpers.audioLanguageLabel(originalAudio) !== 'English (en)') {
+  console.error('Userscript contract failed: English audio was not rendered with its language code.');
+  process.exit(1);
+}
+if (helpers.audioLanguageLabel(hindiDub) !== 'Hindi (hi)') {
+  console.error('Userscript contract failed: Hindi audio was not rendered with its language code.');
+  process.exit(1);
+}
+if (helpers.audioPreferenceLabel(originalAudio) !== 'Original' || helpers.audioPreferenceLabel(hindiDub) !== '') {
+  console.error('Userscript contract failed: original/dubbed audio markers are incorrect.');
+  process.exit(1);
+}
+if (helpers.audioPreferenceScore(originalAudio) <= helpers.audioPreferenceScore(hindiDub)) {
+  console.error('Userscript contract failed: a higher-bitrate dubbed track outranks the original audio.');
+  process.exit(1);
+}
+if (helpers.audioLanguageLabel({}) !== 'Language unknown') {
+  console.error('Userscript contract failed: missing language metadata has no safe fallback.');
+  process.exit(1);
+}
+
+console.log('Userscript metadata, pairing, multilingual audio selection, retry, persistent resume, shortcut isolation, fullscreen visibility, three-mode, proxy, TLS bypass, safe-rendering, and diagnostic contracts are present.');

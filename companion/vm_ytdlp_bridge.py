@@ -36,7 +36,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 APP_NAME = "yt-dlp for Violentmonkey Bridge"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 API_VERSION = 1
 DEFAULT_PORT = 17442
 MAX_BODY_BYTES = 64 * 1024
@@ -548,6 +548,8 @@ def sanitize_info(raw: Mapping[str, Any]) -> dict[str, Any]:
                 "acodec": acodec,
                 "dynamic_range": clean_text(item.get("dynamic_range"), 20),
                 "language": clean_text(item.get("language"), 40),
+                "language_preference": optional_number(item.get("language_preference")),
+                "audio_channels": optional_number(item.get("audio_channels")),
                 "filesize": optional_number(item.get("filesize")),
                 "filesize_approx": optional_number(item.get("filesize_approx")),
                 "tbr": optional_number(item.get("tbr")),
@@ -871,7 +873,7 @@ class YtDlpRunner:
         if selection["type"] == "exact":
             format_id = selection["format_id"]
             if download_mode == "audio":
-                return f"{format_id}/bestaudio/best"
+                return format_id
             if download_mode == "video" or selection["has_audio"]:
                 return format_id
             return f"{format_id}+bestaudio"

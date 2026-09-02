@@ -1,3 +1,17 @@
+# Version 1.5.1
+
+Language-aware audio selection for multilingual YouTube videos.
+
+- Added human-readable language names and language codes to every audio-stream option
+- Marked yt-dlp's original/default audio track directly in the selector and metadata chips
+- Sorted original/default audio ahead of dubbed tracks, using bitrate only as a secondary preference
+- Changed Audio-only mode to always expose its real source-track picker
+- Reset format choices when navigating to a different video so a previous track ID cannot carry over accidentally
+- Removed the silent best-audio fallback from exact audio downloads so the selected language cannot be replaced unexpectedly
+- Added multilingual English-original, Hindi-dubbed, and Spanish-dubbed fixtures and regression checks
+
+Run the updater or installer and reinstall the newly generated paired userscript. Existing settings, pairing tokens, and recovery records remain compatible.
+
 # Version 1.5.0
 
 Persistent unfinished-download discovery and YouTube shortcut isolation.

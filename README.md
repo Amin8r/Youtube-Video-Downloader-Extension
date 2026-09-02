@@ -5,7 +5,8 @@ An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` 
 ## What is included
 
 - Three explicit modes: video-only, audio-only, and merged video plus audio
-- Smart quality or exact-format controls for single-stream modes, plus independent video-stream and audio-stream pickers for Merge mode
+- Smart or exact quality controls for Video-only mode, an explicit source-track picker for Audio-only mode, and independent video/audio pickers for Merge mode
+- Human-readable language labels on audio tracks, with yt-dlp's original/default track preferred automatically
 - MP4, MKV, WebM, MP3, M4A, Opus, FLAC, and WAV output choices
 - Manual and automatic subtitles, language patterns, SRT/WebVTT conversion, and optional embedding
 - Thumbnail download/embedding, metadata JSON, description files, chapters, and embedded tags
@@ -135,8 +136,10 @@ Only downloads queued by version 1.5.0 or newer have enough saved context for au
 ## Video-only, audio-only, and Merge modes
 
 - **Video only** downloads a video-only stream. It does not select or add an audio track.
-- **Audio only** downloads the selected or best available audio and extracts or converts it to the chosen codec.
+- **Audio only** downloads the explicitly selected source track and extracts or converts it to the chosen codec.
 - **Merge** presents two independent selectors: one for the video-only stream and one for the audio-only stream. ffmpeg combines those exact choices into one final media file.
+
+Audio-only and Merge mode display each track's language name and code when yt-dlp provides them. Tracks marked as original/default are sorted first, even when a dubbed track has a higher bitrate. Exact audio choices are strict: if the chosen format becomes unavailable, the job fails and can be retried instead of silently substituting another language.
 
 Each job produces one media output. Merge mode explicitly uses yt-dlp's default intermediate cleanup behavior, so successfully merged video and audio inputs are deleted instead of being left beside the final file. Optional subtitles, thumbnails, descriptions, or metadata JSON can still create the sidecar files you selected.
 
@@ -234,7 +237,7 @@ node --check userscript/yt-dlp-for-violentmonkey.user.js
 node tests/userscript_contract.mjs
 ```
 
-The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, shortcut isolation, fullscreen handling, all three download modes, final-only merging, progress parsing, queue completion/failure/cancellation, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
+The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, multilingual audio labels and original-track preference, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, shortcut isolation, fullscreen handling, all three download modes, final-only merging, progress parsing, queue completion/failure/cancellation, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
 
 ## Responsible use
 

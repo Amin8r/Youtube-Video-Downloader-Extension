@@ -211,7 +211,13 @@ class RunnerTests(unittest.TestCase):
             )
         serialized = json.dumps(info)
         self.assertEqual(info["title"], "Fake video <title>")
-        self.assertEqual(len(info["formats"]), 3)
+        self.assertEqual(len(info["formats"]), 5)
+        formats = {item["format_id"]: item for item in info["formats"]}
+        self.assertEqual(formats["140"]["language"], "en")
+        self.assertEqual(formats["140"]["language_preference"], 10)
+        self.assertEqual(formats["140"]["audio_channels"], 2)
+        self.assertEqual(formats["251-hi"]["language"], "hi")
+        self.assertEqual(formats["251-hi"]["language_preference"], -1)
         self.assertNotIn("googlevideo", serialized)
         self.assertNotIn('"url"', serialized)
         self.assertEqual(info["subtitles"], {"en": ["vtt"]})
@@ -279,7 +285,7 @@ class RunnerTests(unittest.TestCase):
         request["selection"] = {"type": "exact", "format_id": "140", "has_video": False, "has_audio": True}
         options = bridge.validate_job_payload(request)
         command = self.runner.build_download_command(options)
-        self.assertEqual(command[command.index("--format") + 1], "140/bestaudio/best")
+        self.assertEqual(command[command.index("--format") + 1], "140")
         self.assertIn("--extract-audio", command)
         self.assertNotIn("--merge-output-format", command)
         self.assertNotIn("--embed-subs", command)
@@ -522,6 +528,7 @@ class PairingTests(unittest.TestCase):
             self.assertNotIn("__VM_YTDLP_API_BASE__", source)
             self.assertIn(config.token, source)
             self.assertIn("http://127.0.0.1:18443", source)
+            self.assertIn("// @version      1.5.1", source)
             self.assertIn("BOOTSTRAP_TOKEN.length >= 32", source)
 
 
@@ -566,6 +573,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 401)
         status, payload = self.request("GET", "/api/v1/health")
         self.assertEqual(status, 200)
+        self.assertEqual(payload["version"], "1.5.1")
         self.assertEqual(payload["yt_dlp_version"], "2026.fake")
         self.assertIn("proxy", payload["capabilities"])
         self.assertIn("invalid_certificates", payload["capabilities"])
