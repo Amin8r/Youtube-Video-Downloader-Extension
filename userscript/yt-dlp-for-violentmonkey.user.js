@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         yt-dlp for Violentmonkey
 // @namespace    local.vm-yt-dlp
-// @version      1.5.1
+// @version      1.6.2
 // @description  A secure, native-feeling YouTube download panel powered by your local yt-dlp.
 // @license      MIT
 // @match        https://www.youtube.com/*
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.5.1';
+  const VERSION = '1.6.2';
   const BOOTSTRAP_TOKEN = '__VM_YTDLP_TOKEN__';
   const BOOTSTRAP_API_BASE = '__VM_YTDLP_API_BASE__';
   const STORAGE_KEY = 'vmYtDlp.settings.v1';
@@ -37,6 +37,7 @@
 
   const ICONS = {
     download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>',
+    playerDownload: '<svg class="vm-ytdlp-player-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M11 3h2v10.17l3.59-3.58L18 11l-6 6-6-6 1.41-1.41L11 13.17V3ZM5 19h14v2H5v-2Z"/></svg>',
     close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>',
     refresh: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.7 9A7 7 0 0 0 6.1 6.1L4 8m16 8-2.1 1.9A7 7 0 0 1 5.3 15"/></svg>',
     settings: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>',
@@ -140,7 +141,8 @@
 
   let shadow;
   let shell;
-  let launcher;
+  let playerButton;
+  let playerButtonBadge;
   let panel;
   let content;
   let connectionBadge;
@@ -338,6 +340,160 @@
     return ICONS.download;
   }
 
+  function ensurePlayerButtonStyle() {
+    const styleId = 'vm-ytdlp-player-button-style';
+    if (document.getElementById(styleId)) return;
+    const cssText = `
+      #vm-ytdlp-player-button {
+        position: relative !important;
+        width: 48px !important;
+        min-width: 48px !important;
+        height: 100% !important;
+        padding: 0 !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        overflow: visible !important;
+        color: #fff !important;
+        background: transparent !important;
+        border: 0 !important;
+        cursor: pointer !important;
+        vertical-align: top !important;
+        box-sizing: border-box !important;
+        opacity: .9;
+        transition: opacity .15s ease !important;
+      }
+      #vm-ytdlp-player-button[hidden] { display: none !important; }
+      #vm-ytdlp-player-button:hover,
+      #vm-ytdlp-player-button:focus-visible,
+      #vm-ytdlp-player-button[aria-expanded='true'] {
+        color: #fff !important;
+        opacity: 1;
+      }
+      #vm-ytdlp-player-button:focus-visible { outline: 2px solid rgba(255, 255, 255, .9) !important; outline-offset: -5px; }
+      #vm-ytdlp-player-button .vm-ytdlp-player-icon {
+        position: relative;
+        z-index: 1;
+        width: 24px !important;
+        height: 24px !important;
+        display: block !important;
+        fill: currentColor !important;
+        stroke: none !important;
+        filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .55));
+        transition: filter .16s ease, transform .1s ease;
+        pointer-events: none;
+      }
+      #vm-ytdlp-player-button .vm-ytdlp-player-icon path { fill: currentColor !important; }
+      #vm-ytdlp-player-button:hover .vm-ytdlp-player-icon,
+      #vm-ytdlp-player-button:focus-visible .vm-ytdlp-player-icon,
+      #vm-ytdlp-player-button[aria-expanded='true'] .vm-ytdlp-player-icon {
+        filter:
+          drop-shadow(0 0 2px rgba(255, 0, 51, 1))
+          drop-shadow(0 0 6px rgba(255, 0, 51, .95))
+          drop-shadow(0 0 12px rgba(255, 0, 51, .55));
+      }
+      #vm-ytdlp-player-button:active .vm-ytdlp-player-icon { transform: scale(.9); }
+      #vm-ytdlp-player-button .vm-ytdlp-player-badge {
+        position: absolute;
+        z-index: 2;
+        top: 5px;
+        right: 2px;
+        min-width: 15px;
+        height: 15px;
+        padding: 0 4px;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid rgba(0, 0, 0, .72);
+        border-radius: 8px;
+        color: #fff;
+        background: #ff0033;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, .48);
+        font: 800 9px/1 Roboto, Arial, sans-serif;
+        pointer-events: none;
+      }
+      #vm-ytdlp-player-button .vm-ytdlp-player-badge.visible { display: inline-flex; }
+      #vm-ytdlp-player-button .vm-ytdlp-player-badge.resume { color: #18130a; background: #ffbd4a; }
+      @media (prefers-reduced-motion: reduce) {
+        #vm-ytdlp-player-button,
+        #vm-ytdlp-player-button .vm-ytdlp-player-icon { transition-duration: .01ms !important; }
+      }
+    `;
+    const parent = document.head || document.documentElement;
+    try {
+      GM_addElement(parent, 'style', { id: styleId, textContent: cssText });
+    } catch (_) {
+      const style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = cssText;
+      parent.appendChild(style);
+    }
+  }
+
+  function buildPlayerButton() {
+    ensurePlayerButtonStyle();
+    const button = document.createElement('button');
+    button.id = 'vm-ytdlp-player-button';
+    button.className = 'ytp-button vm-ytdlp-player-button';
+    button.type = 'button';
+    button.title = 'Download with yt-dlp';
+    button.setAttribute('data-title-no-tooltip', 'Download with yt-dlp');
+    button.setAttribute('data-priority', '7');
+    button.setAttribute('aria-label', 'Open yt-dlp download panel');
+    button.setAttribute('aria-haspopup', 'dialog');
+    button.setAttribute('aria-expanded', 'false');
+    replaceMarkup(button, `${ICONS.playerDownload}<span class="vm-ytdlp-player-badge" aria-hidden="true"></span>`);
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openPanel('download');
+    });
+    for (const eventName of ['pointerdown', 'mousedown', 'mouseup', 'dblclick', 'keydown', 'keyup']) {
+      button.addEventListener(eventName, (event) => event.stopPropagation());
+    }
+    playerButtonBadge = button.querySelector('.vm-ytdlp-player-badge');
+    return button;
+  }
+
+  function findPlayerRightControls() {
+    const primary = document.querySelector('#movie_player .ytp-right-controls');
+    if (primary) return primary;
+    return Array.from(document.querySelectorAll('.html5-video-player .ytp-right-controls'))
+      .find((controls) => !controls.closest('ytd-miniplayer')) || null;
+  }
+
+  function findDirectPlayerControlAnchor(controls) {
+    const children = Array.from(controls?.children || []);
+    const rightGroup = children.find((child) => child.classList?.contains('ytp-right-controls-right'));
+    if (rightGroup) return rightGroup;
+    const anchorClasses = ['ytp-subtitles-button', 'ytp-settings-button', 'ytp-miniplayer-button', 'ytp-size-button', 'ytp-fullscreen-button'];
+    return children.find((child) => anchorClasses.some((className) => child.classList?.contains(className))) || null;
+  }
+
+  function syncPlayerButtonVisibility(fullscreen = isFullscreenActive()) {
+    if (!playerButton) return;
+    const hidden = fullscreen || !currentVideoUrl() || !playerButton.isConnected;
+    playerButton.hidden = hidden;
+    playerButton.tabIndex = hidden ? -1 : 0;
+    playerButton.setAttribute('aria-hidden', String(hidden));
+  }
+
+  function ensurePlayerButton() {
+    if (!playerButton) playerButton = buildPlayerButton();
+    const controls = currentVideoUrl() ? findPlayerRightControls() : null;
+    if (!controls) {
+      if (playerButton.isConnected) playerButton.remove();
+      syncPlayerButtonVisibility();
+      return false;
+    }
+    const anchor = findDirectPlayerControlAnchor(controls);
+    if (playerButton.parentElement !== controls || (anchor && playerButton.nextElementSibling !== anchor)) {
+      controls.insertBefore(playerButton, anchor || null);
+    }
+    syncPlayerButtonVisibility();
+    return true;
+  }
+
   function createUi() {
     if (document.getElementById('vm-ytdlp-bridge-host')) return;
     const host = document.createElement('div');
@@ -373,54 +529,6 @@
           color: var(--text);
         }
         .vm-shell.fullscreen-hidden { display: none !important; }
-        .vm-launcher {
-          pointer-events: auto;
-          position: absolute;
-          right: 22px;
-          bottom: 22px;
-          width: 56px;
-          height: 56px;
-          border-radius: 18px;
-          display: grid;
-          place-items: center;
-          color: #fff;
-          cursor: pointer;
-          background: linear-gradient(145deg, #ff4765, #e50032);
-          box-shadow: 0 14px 38px rgba(229,0,50,.35), inset 0 1px 0 rgba(255,255,255,.24);
-          transition: transform .2s ease, box-shadow .2s ease, opacity .2s ease;
-        }
-        .vm-launcher::after {
-          content: '';
-          position: absolute;
-          inset: -5px;
-          border: 1px solid rgba(255,49,85,.32);
-          border-radius: 22px;
-          opacity: 0;
-          transform: scale(.9);
-          transition: .2s ease;
-        }
-        .vm-launcher:hover { transform: translateY(-2px) scale(1.025); box-shadow: 0 18px 44px rgba(229,0,50,.46); }
-        .vm-launcher:hover::after { opacity: 1; transform: scale(1); }
-        .vm-launcher:active { transform: scale(.96); }
-        .vm-launcher svg { width: 25px; height: 25px; stroke-width: 2.1; }
-        .vm-launcher-badge {
-          position: absolute;
-          top: -5px;
-          right: -5px;
-          min-width: 21px;
-          height: 21px;
-          border-radius: 11px;
-          display: none;
-          place-items: center;
-          padding: 0 5px;
-          color: #fff;
-          background: #292b32;
-          border: 2px solid #0f1013;
-          font-size: 10px;
-          font-weight: 800;
-        }
-        .vm-launcher-badge.visible { display: grid; }
-        .vm-launcher-badge.resume { color: #18130a; background: var(--amber); }
         .vm-backdrop {
           position: absolute;
           inset: 0;
@@ -452,7 +560,6 @@
         }
         .vm-shell.open .vm-panel { transform: translateX(0) scale(1); opacity: 1; }
         .vm-shell.open .vm-backdrop { opacity: 1; pointer-events: auto; }
-        .vm-shell.open .vm-launcher { opacity: 0; pointer-events: none; transform: scale(.8); }
         .vm-header { padding: 18px 18px 13px; border-bottom: 1px solid var(--line); background: rgba(10,11,14,.48); }
         .vm-title-row { display: flex; align-items: center; gap: 12px; }
         .vm-logo {
@@ -663,7 +770,6 @@
         .vm-footer { margin-top: 13px; color: #50525b; text-align: center; font-size: 9px; }
         @media (max-width: 600px) {
           .vm-panel { inset: 0; width: 100%; border: 0; border-radius: 0; }
-          .vm-launcher { right: 15px; bottom: 15px; }
           .vm-content { padding-left: 14px; padding-right: 14px; }
         }
         @media (prefers-reduced-motion: reduce) {
@@ -672,9 +778,6 @@
       </style>
       <div class="vm-shell">
         <div class="vm-backdrop" data-action="close"></div>
-        <button class="vm-launcher" type="button" aria-label="Open yt-dlp download panel">
-          ${ICONS.download}<span class="vm-launcher-badge"></span>
-        </button>
         <aside class="vm-panel" role="dialog" aria-modal="true" aria-label="yt-dlp download panel">
           <header class="vm-header">
             <div class="vm-title-row">
@@ -711,14 +814,13 @@
     }
 
     shell = shadow.querySelector('.vm-shell');
-    launcher = shadow.querySelector('.vm-launcher');
     panel = shadow.querySelector('.vm-panel');
     content = shadow.querySelector('.vm-content');
     connectionBadge = shadow.querySelector('.vm-status');
     queueBadge = shadow.querySelector('.vm-tab-count');
     toastRack = shadow.querySelector('.vm-toast-rack');
 
-    launcher.addEventListener('click', openPanel);
+    ensurePlayerButton();
     shadow.addEventListener('click', handleShellClick);
     shadow.addEventListener('keydown', stopYouTubeShortcuts);
     shadow.addEventListener('keyup', stopYouTubeShortcuts);
@@ -744,8 +846,10 @@
   function syncFullscreenVisibility() {
     if (!shell) return;
     const fullscreen = isFullscreenActive();
+    if (!fullscreen) ensurePlayerButton();
     shell.classList.toggle('fullscreen-hidden', fullscreen);
     shell.setAttribute('aria-hidden', String(fullscreen));
+    syncPlayerButtonVisibility(fullscreen);
     if (fullscreen && state.open) {
       state.open = false;
       shell.classList.remove('open');
@@ -788,7 +892,8 @@
   function closePanel() {
     state.open = false;
     shell.classList.remove('open');
-    launcher.focus({ preventScroll: true });
+    playerButton?.setAttribute('aria-expanded', 'false');
+    if (playerButton?.isConnected && !playerButton.hidden) playerButton.focus({ preventScroll: true });
   }
 
   function updateChrome() {
@@ -806,10 +911,12 @@
     const attentionCount = activeCount + resumableCount;
     queueBadge.hidden = attentionCount === 0;
     queueBadge.textContent = String(attentionCount);
-    const launcherBadge = shadow.querySelector('.vm-launcher-badge');
-    launcherBadge.classList.toggle('visible', attentionCount > 0);
-    launcherBadge.classList.toggle('resume', activeCount === 0 && resumableCount > 0);
-    launcherBadge.textContent = String(attentionCount);
+    playerButton?.setAttribute('aria-expanded', String(state.open));
+    if (playerButtonBadge) {
+      playerButtonBadge.classList.toggle('visible', attentionCount > 0);
+      playerButtonBadge.classList.toggle('resume', activeCount === 0 && resumableCount > 0);
+      playerButtonBadge.textContent = String(attentionCount);
+    }
   }
 
   function renderCurrentTab() {
@@ -1676,6 +1783,7 @@
 
   function watchNavigation() {
     const handle = () => {
+      ensurePlayerButton();
       if (location.href === state.lastUrl) return;
       state.lastUrl = location.href;
       const nextUrl = currentVideoUrl();

@@ -1,3 +1,42 @@
+# Version 1.6.2
+
+Native player-icon visual refinement.
+
+- Changed the player download icon from red to white so it matches YouTube's captions, settings, theater, and fullscreen controls
+- Changed the glyph and rendered size to YouTube's native-looking 24-by-24-pixel filled icon treatment
+- Removed the red circular hover background
+- Added a layered red outer glow on pointer hover and keyboard focus while keeping the glyph itself white
+- Preserved the direct `.ytp-right-controls` placement, responsive priority, queue badge, SPA reinsertion, and fullscreen hiding
+- Added visual-style regression contracts for the white default state and red hover glow
+
+Run the updater or installer and reinstall the newly generated paired userscript. Existing settings, pairing tokens, queued jobs, and recovery records remain compatible.
+
+# Version 1.6.1
+
+Current YouTube split-control layout hotfix.
+
+- Fixed the missing player button caused by using a nested captions/settings button as the reference node for the outer `.ytp-right-controls` container
+- Mounted the download button as a direct child of `.ytp-right-controls`, immediately before `.ytp-right-controls-right`
+- Added priority metadata so the custom control participates more naturally in YouTube's responsive player toolbar
+- Retained a fallback for older flat player-control layouts
+- Added a regression fixture matching YouTube's current left-group/right-group control structure and a strict direct-child insertion check
+
+Run the updater or installer and reinstall the newly generated paired userscript. Existing settings, pairing tokens, queued jobs, and recovery records remain compatible.
+
+# Version 1.6.0
+
+Native YouTube player-control integration.
+
+- Replaced the floating lower-right launcher with a compact button inside YouTube's right-side player controls
+- Added a filled YouTube-style download glyph with a red finish and a subtle matching hover treatment
+- Positioned the control immediately before captions/settings when those controls are present
+- Preserved the active-download and resumable-job count badge on the new player button
+- Reinserted the button automatically after YouTube SPA navigation or player-control reconstruction
+- Kept the button and panel hidden in fullscreen mode
+- Added regression contracts for player placement, fullscreen visibility, and removal of the old floating launcher
+
+Run the updater or installer and reinstall the newly generated paired userscript. Existing settings, pairing tokens, queued jobs, and recovery records remain compatible.
+
 # Version 1.5.1
 
 Language-aware audio selection for multilingual YouTube videos.

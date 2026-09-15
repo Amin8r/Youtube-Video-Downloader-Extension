@@ -1,6 +1,6 @@
 # yt-dlp for Violentmonkey
 
-An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` running on your own computer. It adds a polished download panel to YouTube, while extraction, browser-cookie access, merging, post-processing, and file writing remain in a loopback-only companion process.
+An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` running on your own computer. A download control inside YouTube's player opens the polished download panel, while extraction, browser-cookie access, merging, post-processing, and file writing remain in a loopback-only companion process.
 
 ## What is included
 
@@ -18,7 +18,8 @@ An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` 
 - Per-userscript HTTP, HTTPS, SOCKS4, SOCKS4A, or SOCKS5 proxy support for metadata and downloads
 - Optional self-signed/invalid TLS certificate support, disabled by default with an in-panel security warning
 - YouTube SPA, Shorts, live-video, mobile YouTube, and YouTube Music watch-page support
-- Automatic launcher and panel hiding while the YouTube player is in fullscreen mode
+- Compact white YouTube-style download button with a red hover glow, mounted directly in the player's right-side controls between its settings and theater/fullscreen groups
+- Automatic download-button and panel hiding while the YouTube player is in fullscreen mode
 - Keyboard isolation so typing proxy addresses or other settings cannot trigger YouTube shortcuts such as Theater mode
 - Firefox and Chromium support through Violentmonkey
 
@@ -51,7 +52,7 @@ This is the recommended path for Ubuntu, Debian, Fedora, Arch, and other systemd
    ```
 
 3. The installer creates `yt-dlp-for-violentmonkey.paired.user.js` beside itself. Open the Violentmonkey dashboard and install that file.
-4. Open a YouTube video and click the red yt-dlp button at the lower-right.
+4. Open a YouTube video and click the white download button inside the right-side player controls, between settings and theater/fullscreen. It glows red when hovered.
 
 The bridge starts automatically in your user session. Downloads go to `~/Downloads/YouTube` by default.
 
@@ -176,7 +177,7 @@ If you installed with a non-default config path, add `--config /path/to/config.j
 
 Common causes:
 
-- **No red launcher appears:** install the newest paired userscript and reload the YouTube tab. Violentmonkey's menu now includes **Show yt-dlp diagnostics**, and a startup failure displays a small **yt-dlp UI error** button instead of failing silently.
+- **No player download button appears:** install the newest paired userscript and reload the YouTube tab. The button is inserted after YouTube creates its player controls and is intentionally hidden in fullscreen. Violentmonkey's menu includes **Show yt-dlp diagnostics**, and a startup failure displays a small **yt-dlp UI error** button instead of failing silently.
 - **Panel says service unavailable:** start or restart the background service, then use **Test connection** in Settings.
 - **Unauthorized:** reinstall the paired userscript or print the current token with the companion's `print-token` command and paste it in Settings.
 - **A merged video has no audio:** confirm that both a video stream and an audio stream are selected, and install the actual `ffmpeg` executable rather than a Python package named ffmpeg.
@@ -237,7 +238,7 @@ node --check userscript/yt-dlp-for-violentmonkey.user.js
 node tests/userscript_contract.mjs
 ```
 
-The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, multilingual audio labels and original-track preference, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, shortcut isolation, fullscreen handling, all three download modes, final-only merging, progress parsing, queue completion/failure/cancellation, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
+The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, in-player button placement, multilingual audio labels and original-track preference, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, shortcut isolation, fullscreen handling, all three download modes, final-only merging, progress parsing, queue completion/failure/cancellation, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
 
 ## Responsible use
 

@@ -528,7 +528,7 @@ class PairingTests(unittest.TestCase):
             self.assertNotIn("__VM_YTDLP_API_BASE__", source)
             self.assertIn(config.token, source)
             self.assertIn("http://127.0.0.1:18443", source)
-            self.assertIn("// @version      1.5.1", source)
+            self.assertIn("// @version      1.6.2", source)
             self.assertIn("BOOTSTRAP_TOKEN.length >= 32", source)
 
 
@@ -573,7 +573,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 401)
         status, payload = self.request("GET", "/api/v1/health")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["version"], "1.5.1")
+        self.assertEqual(payload["version"], "1.6.2")
         self.assertEqual(payload["yt_dlp_version"], "2026.fake")
         self.assertIn("proxy", payload["capabilities"])
         self.assertIn("invalid_certificates", payload["capabilities"])

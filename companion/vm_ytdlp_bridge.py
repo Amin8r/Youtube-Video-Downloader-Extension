@@ -36,7 +36,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 APP_NAME = "yt-dlp for Violentmonkey Bridge"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.2"
 API_VERSION = 1
 DEFAULT_PORT = 17442
 MAX_BODY_BYTES = 64 * 1024

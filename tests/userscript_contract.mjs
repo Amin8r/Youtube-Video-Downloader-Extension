@@ -7,7 +7,9 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const filename = path.resolve(here, '../userscript/yt-dlp-for-violentmonkey.user.js');
+const splitControlsFixtureFilename = path.resolve(here, 'fixtures/youtube-right-controls-split.html');
 const source = fs.readFileSync(filename, 'utf8');
+const splitControlsFixture = fs.readFileSync(splitControlsFixtureFilename, 'utf8');
 
 const requiredFragments = [
   '// @match        https://www.youtube.com/*',
@@ -18,7 +20,7 @@ const requiredFragments = [
   '// @grant        GM_setValue',
   '// @grant        GM_addElement',
   '// @inject-into  content',
-  '// @version      1.5.1',
+  '// @version      1.6.2',
   "attachShadow({ mode: 'closed' })",
   "document.implementation.createHTMLDocument('yt-dlp UI')",
   'replaceMarkup(shadow, `',
@@ -74,6 +76,26 @@ const requiredFragments = [
   '.vm-switch input { position: absolute; inset: 0; z-index: 1;',
   'Authorization: `Bearer ${state.settings.token}`',
   "['127.0.0.1', 'localhost'].includes(url.hostname)",
+  '#vm-ytdlp-player-button {',
+  'position: relative !important;',
+  'color: #fff !important;',
+  'viewBox="0 0 24 24"',
+  'width: 24px !important;',
+  'height: 24px !important;',
+  'fill: currentColor !important;',
+  '#vm-ytdlp-player-button:hover .vm-ytdlp-player-icon,',
+  'drop-shadow(0 0 6px rgba(255, 0, 51, .95))',
+  "button.className = 'ytp-button vm-ytdlp-player-button'",
+  "button.title = 'Download with yt-dlp'",
+  "button.setAttribute('data-priority', '7')",
+  "document.querySelector('#movie_player .ytp-right-controls')",
+  'function findDirectPlayerControlAnchor(controls)',
+  "child.classList?.contains('ytp-right-controls-right')",
+  'playerButton.parentElement !== controls || (anchor && playerButton.nextElementSibling !== anchor)',
+  'controls.insertBefore(playerButton, anchor || null)',
+  "openPanel('download')",
+  'const hidden = fullscreen || !currentVideoUrl() || !playerButton.isConnected',
+  'if (!fullscreen) ensurePlayerButton()',
   '.vm-shell.fullscreen-hidden { display: none !important; }',
   "document.addEventListener('fullscreenchange', syncFullscreenVisibility, true)",
   "document.addEventListener('webkitfullscreenchange', syncFullscreenVisibility, true)",
@@ -96,7 +118,16 @@ if (missing.length) {
   console.error(`Userscript contract failed; missing:\n${missing.join('\n')}`);
   process.exit(1);
 }
-for (const forbidden of ['keep_separate_streams:', "capabilities.includes('separate_streams')", 'Video + audio + merged']) {
+for (const forbidden of [
+  'keep_separate_streams:',
+  "capabilities.includes('separate_streams')",
+  'Video + audio + merged',
+  '.vm-launcher',
+  "controls.querySelector('.ytp-subtitles-button",
+  '#vm-ytdlp-player-button::before',
+  'color: #ff0033 !important;',
+  'background: rgba(255, 0, 51, .16);',
+]) {
   if (source.includes(forbidden)) {
     console.error(`Userscript contract failed: obsolete fragment remains: ${forbidden}`);
     process.exit(1);
@@ -166,4 +197,109 @@ if (helpers.audioLanguageLabel({}) !== 'Language unknown') {
   process.exit(1);
 }
 
-console.log('Userscript metadata, pairing, multilingual audio selection, retry, persistent resume, shortcut isolation, fullscreen visibility, three-mode, proxy, TLS bypass, safe-rendering, and diagnostic contracts are present.');
+const playerHelperStart = source.indexOf('function findPlayerRightControls()');
+const playerHelperEnd = source.indexOf('function createUi()', playerHelperStart);
+if (playerHelperStart < 0 || playerHelperEnd <= playerHelperStart) {
+  console.error('Userscript contract failed: player-button helpers could not be isolated.');
+  process.exit(1);
+}
+for (const fragment of [
+  '<div class="ytp-right-controls">',
+  '<div class="ytp-right-controls-left">',
+  '<div class="ytp-right-controls-right">',
+  '<button class="ytp-pip-button ytp-button"',
+]) {
+  if (!splitControlsFixture.includes(fragment)) {
+    console.error(`Userscript contract failed: current YouTube controls fixture is missing ${fragment}`);
+    process.exit(1);
+  }
+}
+
+function fakeControl(...classes) {
+  return {
+    parentElement: null,
+    isConnected: true,
+    classList: { contains: (className) => classes.includes(className) },
+  };
+}
+const leftGroup = fakeControl('ytp-right-controls-left');
+const rightGroup = fakeControl('ytp-right-controls-right');
+const pipButton = fakeControl('ytp-pip-button', 'ytp-button');
+const nestedSubtitlesButton = fakeControl('ytp-subtitles-button', 'ytp-button');
+nestedSubtitlesButton.parentElement = leftGroup;
+const controls = {
+  children: [leftGroup, rightGroup, pipButton],
+  inserted: null,
+  querySelector() {
+    return nestedSubtitlesButton;
+  },
+  insertBefore(button, before) {
+    if (before !== null && !this.children.includes(before)) throw new Error('NotFoundError');
+    this.inserted = { button, before };
+    button.parentElement = this;
+    button.isConnected = true;
+    button.nextElementSibling = before;
+  },
+};
+for (const child of controls.children) child.parentElement = controls;
+const fakeDocument = {
+  activeControls: controls,
+  querySelector(selector) {
+    return selector === '#movie_player .ytp-right-controls' ? this.activeControls : null;
+  },
+  querySelectorAll() {
+    return [];
+  },
+};
+const playerHelpers = new Function(
+  'document',
+  `let playerButton = null;
+   let mockVideoUrl = 'https://www.youtube.com/watch?v=abcdefghijk';
+   function currentVideoUrl() { return mockVideoUrl; }
+   function isFullscreenActive() { return false; }
+   function buildPlayerButton() {
+     return {
+       parentElement: null,
+       nextElementSibling: null,
+       isConnected: false,
+       hidden: true,
+       tabIndex: -1,
+       attributes: new Map(),
+       setAttribute(name, value) { this.attributes.set(name, value); },
+       remove() { this.parentElement = null; this.isConnected = false; },
+     };
+   }
+   ${source.slice(playerHelperStart, playerHelperEnd)}
+   return {
+     ensurePlayerButton,
+     syncPlayerButtonVisibility,
+     getButton: () => playerButton,
+     setVideoUrl: (value) => { mockVideoUrl = value; },
+   };`,
+)(fakeDocument);
+if (!playerHelpers.ensurePlayerButton()) {
+  console.error('Userscript contract failed: player button was not inserted into available controls.');
+  process.exit(1);
+}
+const insertedButton = playerHelpers.getButton();
+if (controls.inserted?.button !== insertedButton || controls.inserted?.before !== rightGroup
+    || insertedButton.parentElement !== controls) {
+  console.error('Userscript contract failed: player button was not mounted directly between YouTube control groups.');
+  process.exit(1);
+}
+if (insertedButton.hidden || insertedButton.tabIndex !== 0 || insertedButton.attributes.get('aria-hidden') !== 'false') {
+  console.error('Userscript contract failed: in-player button is not visible and keyboard-accessible on a watch page.');
+  process.exit(1);
+}
+playerHelpers.syncPlayerButtonVisibility(true);
+if (!insertedButton.hidden || insertedButton.tabIndex !== -1 || insertedButton.attributes.get('aria-hidden') !== 'true') {
+  console.error('Userscript contract failed: in-player button remains accessible in fullscreen.');
+  process.exit(1);
+}
+playerHelpers.setVideoUrl('');
+if (playerHelpers.ensurePlayerButton() || insertedButton.isConnected || !insertedButton.hidden) {
+  console.error('Userscript contract failed: in-player button remains attached away from a video page.');
+  process.exit(1);
+}
+
+console.log('Userscript metadata, pairing, native white/red-glow player styling, in-player control placement, multilingual audio selection, retry, persistent resume, shortcut isolation, fullscreen visibility, three-mode, proxy, TLS bypass, safe-rendering, and diagnostic contracts are present.');
