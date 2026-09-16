@@ -20,7 +20,7 @@ const requiredFragments = [
   '// @grant        GM_setValue',
   '// @grant        GM_addElement',
   '// @inject-into  content',
-  '// @version      1.6.2',
+  '// @version      1.7.1',
   "attachShadow({ mode: 'closed' })",
   "document.implementation.createHTMLDocument('yt-dlp UI')",
   'replaceMarkup(shadow, `',
@@ -101,12 +101,39 @@ const requiredFragments = [
   "document.addEventListener('webkitfullscreenchange', syncFullscreenVisibility, true)",
   'document.fullscreenElement || document.webkitFullscreenElement',
   "shell.classList.toggle('fullscreen-hidden', fullscreen)",
+  'function isYouTubeHomepage()',
+  'class="vm-home-launcher"',
+  "data-action=\"open-home-panel\"",
+  'function syncHomepageLauncherVisibility(',
+  'isYouTubeHomepage() && !fullscreen && !state.open',
+  'homeLauncherBadge.classList.toggle(\'visible\'',
   'data-resume-job="${h(job.id)}"',
   'data-forget-job="${h(job.id)}"',
+  'aria-label="Pause download"',
+  '${ICONS.pause}</button>',
   '/resume`, {',
   '/forget`, {})',
   "window.confirm('Forget this recovery record?",
-  'Recovered downloads stay paused until you choose Resume',
+  'Paused and recovered downloads stay resumable until you choose Resume',
+  'expandedJobDetails: new Set()',
+  'function captureQueueViewState()',
+  'function updateQueueView()',
+  'card.dataset.jobStructure === jobStructureKey(job, view)',
+  'textNode.data = nextText',
+  'data-job-id="${h(job.id)}"',
+  "content.addEventListener('click', handleQueueActionClick)",
+  "details.querySelector('summary')?.addEventListener('click'",
+  "!updateQueueView()) renderQueue()",
+  'data-job-details="${h(job.id)}"',
+  'state.expandedJobDetails.add(jobId)',
+  'stickToBottom: pre.scrollHeight - pre.clientHeight - pre.scrollTop < 10',
+  '`Avg ${formatBytes(progress.speed)}/s`',
+  '.vm-input:disabled, .vm-select:disabled',
+  '.vm-toggle-row.disabled',
+  "animateContentChange('vm-view-refresh')",
+  '@keyframes vm-view-enter',
+  "shadow.addEventListener('keydown', handleTabKeyboard)",
+  "['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)",
   "shadow.addEventListener('keydown', stopYouTubeShortcuts)",
   "shadow.addEventListener('keyup', stopYouTubeShortcuts)",
   "shadow.addEventListener('keypress', stopYouTubeShortcuts)",
@@ -127,6 +154,9 @@ for (const forbidden of [
   '#vm-ytdlp-player-button::before',
   'color: #ff0033 !important;',
   'background: rgba(255, 0, 51, .16);',
+  '${ICONS.stop}',
+  'let readyForUserToggle = false;',
+  "if ((forceRender || state.tab === 'queue') && state.open) renderQueue();",
 ]) {
   if (source.includes(forbidden)) {
     console.error(`Userscript contract failed: obsolete fragment remains: ${forbidden}`);
@@ -194,6 +224,26 @@ if (helpers.audioPreferenceScore(originalAudio) <= helpers.audioPreferenceScore(
 }
 if (helpers.audioLanguageLabel({}) !== 'Language unknown') {
   console.error('Userscript contract failed: missing language metadata has no safe fallback.');
+  process.exit(1);
+}
+
+const homepageHelperStart = source.indexOf('function isYouTubeHomepage()');
+const homepageHelperEnd = source.indexOf('function formatBytes(', homepageHelperStart);
+if (homepageHelperStart < 0 || homepageHelperEnd <= homepageHelperStart) {
+  console.error('Userscript contract failed: homepage detection helper could not be isolated.');
+  process.exit(1);
+}
+const homepageHelperSource = source.slice(homepageHelperStart, homepageHelperEnd);
+const isHomepage = (href) => new Function(
+  'location',
+  `${homepageHelperSource}; return isYouTubeHomepage();`,
+)({ href });
+if (!isHomepage('https://www.youtube.com/')
+    || !isHomepage('https://music.youtube.com/?persist_app=1')
+    || isHomepage('https://www.youtube.com/watch?v=dQw4w9WgXcQ')
+    || isHomepage('https://www.youtube.com/results?search_query=test')
+    || isHomepage('https://example.com/')) {
+  console.error('Userscript contract failed: the floating launcher is not restricted to YouTube homepages.');
   process.exit(1);
 }
 
@@ -302,4 +352,25 @@ if (playerHelpers.ensurePlayerButton() || insertedButton.isConnected || !inserte
   process.exit(1);
 }
 
-console.log('Userscript metadata, pairing, native white/red-glow player styling, in-player control placement, multilingual audio selection, retry, persistent resume, shortcut isolation, fullscreen visibility, three-mode, proxy, TLS bypass, safe-rendering, and diagnostic contracts are present.');
+const incrementalQueueStart = source.indexOf('function updateLogText(');
+const fullQueueRenderStart = source.indexOf('function renderQueue()', incrementalQueueStart);
+const incrementalQueueSource = source.slice(incrementalQueueStart, fullQueueRenderStart);
+if (incrementalQueueStart < 0 || fullQueueRenderStart <= incrementalQueueStart
+    || incrementalQueueSource.includes('replaceMarkup(content')
+    || !incrementalQueueSource.includes('textNode.data = nextText')
+    || !incrementalQueueSource.includes('updateJobCard(plan.card, plan.job)')) {
+  console.error('Userscript contract failed: active Queue polling can rebuild the log DOM instead of updating it in place.');
+  process.exit(1);
+}
+const detailsBindingStart = source.indexOf('function bindJobDetails(');
+const detailsBindingEnd = source.indexOf('function bindQueueHandlers(', detailsBindingStart);
+const detailsBindingSource = source.slice(detailsBindingStart, detailsBindingEnd);
+const revealIndex = detailsBindingSource.indexOf("details.classList.add('just-opened')");
+const clickIndex = detailsBindingSource.indexOf("querySelector('summary')?.addEventListener('click'");
+const toggleIndex = detailsBindingSource.indexOf("details.addEventListener('toggle'");
+if (clickIndex < 0 || revealIndex < clickIndex || toggleIndex < revealIndex) {
+  console.error('Userscript contract failed: log reveal animation is not isolated to a deliberate user open.');
+  process.exit(1);
+}
+
+console.log('Userscript metadata, pairing, native player and homepage launchers, flicker-free persistent logs, pause semantics, average speed, disabled states, motion, multilingual audio selection, retry, resume, shortcut isolation, fullscreen visibility, three-mode, proxy, TLS bypass, safe-rendering, and diagnostic contracts are present.');

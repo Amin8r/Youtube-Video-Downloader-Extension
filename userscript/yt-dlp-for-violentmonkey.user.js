@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         yt-dlp for Violentmonkey
 // @namespace    local.vm-yt-dlp
-// @version      1.6.2
+// @version      1.7.1
 // @description  A secure, native-feeling YouTube download panel powered by your local yt-dlp.
 // @license      MIT
 // @match        https://www.youtube.com/*
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.6.2';
+  const VERSION = '1.7.1';
   const BOOTSTRAP_TOKEN = '__VM_YTDLP_TOKEN__';
   const BOOTSTRAP_API_BASE = '__VM_YTDLP_API_BASE__';
   const STORAGE_KEY = 'vmYtDlp.settings.v1';
@@ -52,7 +52,7 @@
     folder: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a3 3 0 0 1-3 3H5a2 2 0 0 1-2-2V6Z"/></svg>',
     shield: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></svg>',
     trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></svg>',
-    stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+    pause: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg>',
     chevron: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>',
   };
 
@@ -109,6 +109,7 @@
     infoError: null,
     jobs: [],
     revision: -1,
+    expandedJobDetails: new Set(),
     proxyHidden: false,
     form: {
       downloadMode: 'merge',
@@ -143,12 +144,15 @@
   let shell;
   let playerButton;
   let playerButtonBadge;
+  let homeLauncher;
+  let homeLauncherBadge;
   let panel;
   let content;
   let connectionBadge;
   let queueBadge;
   let toastRack;
   let languageDisplayNames = null;
+  let viewAnimationTimer = 0;
 
   function h(value) {
     return String(value ?? '')
@@ -168,6 +172,12 @@
       fragment.appendChild(document.importNode(node, true));
     }
     target.replaceChildren(fragment);
+  }
+
+  function elementFromMarkup(markup) {
+    const container = document.createElement('div');
+    replaceMarkup(container, markup);
+    return container.firstElementChild;
   }
 
   function validApiBase(value) {
@@ -314,6 +324,17 @@
     }
   }
 
+  function isYouTubeHomepage() {
+    try {
+      const url = new URL(location.href);
+      const host = url.hostname.toLowerCase();
+      return ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'].includes(host)
+        && (url.pathname === '' || url.pathname === '/');
+    } catch (_) {
+      return false;
+    }
+  }
+
   function formatBytes(value) {
     const number = Number(value);
     if (!Number.isFinite(number) || number <= 0) return '—';
@@ -335,7 +356,7 @@
   function phaseIcon(status) {
     if (status === 'completed') return ICONS.check;
     if (status === 'failed') return ICONS.alert;
-    if (status === 'cancelled') return ICONS.stop;
+    if (status === 'cancelled') return ICONS.pause;
     if (status === 'interrupted') return ICONS.refresh;
     return ICONS.download;
   }
@@ -529,6 +550,60 @@
           color: var(--text);
         }
         .vm-shell.fullscreen-hidden { display: none !important; }
+        .vm-home-launcher {
+          pointer-events: none;
+          position: absolute;
+          right: 22px;
+          bottom: 22px;
+          width: 56px;
+          height: 56px;
+          display: grid;
+          place-items: center;
+          border-radius: 18px;
+          color: #fff;
+          background: linear-gradient(145deg, #ff4765, #e50032);
+          box-shadow: 0 14px 38px rgba(229,0,50,.35), inset 0 1px 0 rgba(255,255,255,.24);
+          cursor: pointer;
+          opacity: 0;
+          visibility: hidden;
+          transform: translateY(8px) scale(.9);
+          transition: opacity .2s ease, visibility .2s ease, transform .2s cubic-bezier(.2,.8,.2,1), box-shadow .2s ease;
+        }
+        .vm-home-launcher.visible { pointer-events: auto; opacity: 1; visibility: visible; transform: translateY(0) scale(1); }
+        .vm-home-launcher::after {
+          content: '';
+          position: absolute;
+          inset: -5px;
+          border: 1px solid rgba(255,49,85,.32);
+          border-radius: 22px;
+          opacity: 0;
+          transform: scale(.9);
+          transition: opacity .2s ease, transform .2s ease;
+        }
+        .vm-home-launcher:hover { transform: translateY(-2px) scale(1.025); box-shadow: 0 18px 44px rgba(229,0,50,.46); }
+        .vm-home-launcher:hover::after { opacity: 1; transform: scale(1); }
+        .vm-home-launcher:active { transform: scale(.96); }
+        .vm-home-launcher:focus-visible { outline: 3px solid rgba(255,255,255,.92); outline-offset: 4px; }
+        .vm-home-launcher svg { width: 25px; height: 25px; stroke-width: 2.1; }
+        .vm-home-launcher-badge {
+          position: absolute;
+          top: -5px;
+          right: -5px;
+          min-width: 21px;
+          height: 21px;
+          padding: 0 5px;
+          display: none;
+          place-items: center;
+          border: 2px solid #0f1013;
+          border-radius: 11px;
+          color: #fff;
+          background: #292b32;
+          font-size: 10px;
+          font-weight: 800;
+        }
+        .vm-home-launcher-badge.visible { display: grid; }
+        .vm-home-launcher-badge.resume { color: #18130a; background: var(--amber); }
+        .vm-shell.open .vm-home-launcher { pointer-events: none; opacity: 0; visibility: hidden; transform: scale(.8); }
         .vm-backdrop {
           position: absolute;
           inset: 0;
@@ -609,11 +684,19 @@
           font-weight: 700;
           transition: .17s ease;
         }
-        .vm-tab svg { width: 16px; height: 16px; }
+        .vm-tab svg { width: 16px; height: 16px; transition: transform .18s ease, color .18s ease; }
         .vm-tab:hover { color: #dddde2; }
         .vm-tab.active { color: #fff; background: #292a31; box-shadow: 0 4px 14px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.07); }
+        .vm-tab.active svg { color: #ff607b; transform: translateY(-1px) scale(1.06); }
+        .vm-tab:focus-visible, .vm-mode-card:focus-visible, .vm-icon-btn:focus-visible, .vm-secondary:focus-visible, .vm-job-action:focus-visible { outline: 2px solid rgba(255,49,85,.72); outline-offset: 2px; }
         .vm-tab-count { min-width: 17px; height: 17px; padding: 0 4px; display: inline-grid; place-items: center; border-radius: 9px; color: #fff; background: var(--red); font-size: 9px; }
         .vm-content { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px 22px; overscroll-behavior: contain; scrollbar-color: #34353d transparent; scrollbar-width: thin; }
+        .vm-content.vm-view-enter > * { animation: vm-view-enter .22s cubic-bezier(.2,.8,.2,1) both; }
+        .vm-content.vm-view-enter > *:nth-child(2) { animation-delay: 25ms; }
+        .vm-content.vm-view-enter > *:nth-child(3) { animation-delay: 50ms; }
+        .vm-content.vm-view-refresh > * { animation: vm-view-refresh .18s ease both; }
+        @keyframes vm-view-enter { from { opacity: 0; transform: translateY(6px); } }
+        @keyframes vm-view-refresh { from { opacity: .72; transform: translateY(3px); } }
         .vm-content::-webkit-scrollbar { width: 8px; }
         .vm-content::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 8px; background: #363740; background-clip: padding-box; }
         .vm-card { border: 1px solid var(--line); border-radius: 17px; background: rgba(255,255,255,.035); box-shadow: inset 0 1px 0 rgba(255,255,255,.025); }
@@ -652,10 +735,21 @@
           background: #111217;
           padding: 0 11px;
           font-size: 12px;
-          transition: border-color .16s ease, box-shadow .16s ease;
+          transition: color .16s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease;
         }
         .vm-input::placeholder { color: #5f616b; }
         .vm-input:focus, .vm-select:focus { border-color: rgba(255,49,85,.65); box-shadow: 0 0 0 3px rgba(255,49,85,.095); }
+        .vm-input:disabled, .vm-select:disabled {
+          color: #696b74;
+          border-color: rgba(255,255,255,.055);
+          background-color: #0d0e12;
+          opacity: .68;
+          cursor: not-allowed;
+          box-shadow: none;
+        }
+        .vm-input:disabled::placeholder { color: #454750; }
+        .vm-select:disabled { background-image: linear-gradient(45deg, transparent 50%, #4c4e56 50%), linear-gradient(135deg, #4c4e56 50%, transparent 50%); }
+        .vm-field:has(.vm-input:disabled, .vm-select:disabled) .vm-label { color: #62646d; }
         .vm-input-shell { position: relative; }
         .vm-input-shell .vm-input { padding-right: 43px; }
         .vm-input-action { position: absolute; top: 4px; right: 4px; width: 33px; height: 33px; display: grid; place-items: center; border-radius: 8px; color: #7d7f89; background: #1b1c22; cursor: pointer; transition: .16s ease; }
@@ -666,13 +760,17 @@
         .vm-format-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
         .vm-chip { padding: 3px 7px; border: 1px solid rgba(255,255,255,.075); border-radius: 7px; color: #8e9099; background: rgba(255,255,255,.025); font-size: 9.5px; }
         .vm-toggle-list { overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: #111217; }
-        .vm-toggle-row { min-height: 47px; padding: 9px 11px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.06); cursor: pointer; }
+        .vm-toggle-row { min-height: 47px; padding: 9px 11px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,.06); cursor: pointer; transition: color .16s ease, background-color .16s ease, opacity .16s ease; }
         .vm-toggle-row:last-child { border-bottom: 0; }
+        .vm-toggle-row.disabled { background: rgba(0,0,0,.08); opacity: .55; cursor: not-allowed; }
+        .vm-toggle-row.disabled .vm-toggle-copy strong { color: #777982; }
+        .vm-toggle-row.disabled .vm-toggle-copy small { color: #555760; }
         .vm-toggle-copy { min-width: 0; flex: 1; }
         .vm-toggle-copy strong { display: block; color: #d9d9de; font-size: 11.5px; font-weight: 670; }
         .vm-toggle-copy small { display: block; margin-top: 1px; color: #6e707a; font-size: 9.5px; }
         .vm-switch { position: relative; width: 35px; height: 21px; flex: 0 0 35px; }
         .vm-switch input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+        .vm-switch input:disabled { cursor: not-allowed; }
         .vm-switch span { position: absolute; inset: 0; border-radius: 11px; background: #303139; pointer-events: none; transition: .18s ease; }
         .vm-switch span::after { content: ''; position: absolute; top: 3px; left: 3px; width: 15px; height: 15px; border-radius: 50%; background: #8c8e97; transition: .18s ease; }
         .vm-switch input:checked + span { background: var(--red); }
@@ -730,6 +828,7 @@
         .vm-job-main { min-width: 0; flex: 1; }
         .vm-job-title { overflow: hidden; margin: 1px 0 3px; color: #e7e7ea; font-size: 11.5px; font-weight: 690; text-overflow: ellipsis; white-space: nowrap; }
         .vm-job-phase { display: flex; align-items: center; gap: 5px; color: #81838d; font-size: 9.8px; }
+        .vm-job-phase-icon { width: 12px; height: 12px; flex: 0 0 12px; display: grid; place-items: center; }
         .vm-job-phase svg { width: 12px; height: 12px; }
         .vm-job.completed .vm-job-phase { color: var(--green); }
         .vm-job.failed .vm-job-phase { color: #ff7089; }
@@ -742,14 +841,20 @@
         .vm-job-stats { min-height: 24px; padding-top: 7px; display: flex; align-items: center; gap: 9px; color: #71737d; font-size: 9.5px; }
         .vm-job-stats .spacer { flex: 1; }
         .vm-job-actions { display: flex; align-items: center; gap: 5px; }
-        .vm-job-action { min-width: 26px; height: 26px; padding: 0 7px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border-radius: 8px; color: #81838c; background: rgba(255,255,255,.04); cursor: pointer; font-size: 9px; font-weight: 720; }
+        .vm-job-action { min-width: 26px; height: 26px; padding: 0 7px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border-radius: 8px; color: #81838c; background: rgba(255,255,255,.04); cursor: pointer; font-size: 9px; font-weight: 720; transition: color .16s ease, background-color .16s ease, transform .16s ease; }
         .vm-job-action:hover { color: #fff; background: rgba(255,255,255,.08); }
+        .vm-job-action:active { transform: scale(.94); }
         .vm-job-action svg { width: 13px; height: 13px; }
         .vm-job-action.resume { color: #ffd177; background: rgba(255,189,74,.1); }
         .vm-job-action.resume:hover { color: #ffe3aa; background: rgba(255,189,74,.18); }
+        .vm-job-action.pause:hover { color: #ff8da0; background: rgba(255,49,85,.12); }
         .vm-details { margin-top: 7px; }
-        .vm-details summary { color: #777a84; cursor: pointer; font-size: 9.5px; }
-        .vm-details pre { max-height: 130px; overflow: auto; margin: 7px 0 0; padding: 9px; border-radius: 9px; color: #a6a8b0; background: #0b0c0f; white-space: pre-wrap; word-break: break-word; font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        .vm-details summary { width: max-content; color: #777a84; cursor: pointer; font-size: 9.5px; transition: color .16s ease; }
+        .vm-details summary:hover { color: #b2b4bc; }
+        .vm-details[open] summary { color: #a6a8b0; }
+        .vm-details pre { max-height: 130px; overflow: auto; margin: 7px 0 0; padding: 9px; border-radius: 9px; color: #a6a8b0; background: #0b0c0f; white-space: pre-wrap; word-break: break-word; font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; transform-origin: top; }
+        .vm-details.just-opened pre { animation: vm-log-reveal .18s ease both; }
+        @keyframes vm-log-reveal { from { opacity: 0; transform: translateY(-3px); } }
         .vm-settings-group { overflow: hidden; margin-bottom: 13px; padding: 14px; }
         .vm-settings-title { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; color: #e1e1e5; font-size: 12px; font-weight: 730; }
         .vm-settings-title svg { width: 16px; height: 16px; color: #9c9ea7; }
@@ -771,12 +876,16 @@
         @media (max-width: 600px) {
           .vm-panel { inset: 0; width: 100%; border: 0; border-radius: 0; }
           .vm-content { padding-left: 14px; padding-right: 14px; }
+          .vm-home-launcher { right: 15px; bottom: 15px; }
         }
         @media (prefers-reduced-motion: reduce) {
           *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
         }
       </style>
       <div class="vm-shell">
+        <button class="vm-home-launcher" type="button" data-action="open-home-panel" aria-label="Open yt-dlp download panel" aria-haspopup="dialog" aria-expanded="false" aria-hidden="true" tabindex="-1">
+          ${ICONS.download}<span class="vm-home-launcher-badge" aria-hidden="true"></span>
+        </button>
         <div class="vm-backdrop" data-action="close"></div>
         <aside class="vm-panel" role="dialog" aria-modal="true" aria-label="yt-dlp download panel">
           <header class="vm-header">
@@ -789,13 +898,13 @@
               <button class="vm-icon-btn" type="button" data-action="refresh" aria-label="Refresh video data">${ICONS.refresh}</button>
               <button class="vm-icon-btn" type="button" data-action="close" aria-label="Close panel">${ICONS.close}</button>
             </div>
-            <nav class="vm-nav" aria-label="yt-dlp sections">
-              <button class="vm-tab active" type="button" data-tab="download">${ICONS.download}<span>Download</span></button>
-              <button class="vm-tab" type="button" data-tab="queue">${ICONS.queue}<span>Queue</span><span class="vm-tab-count" hidden>0</span></button>
-              <button class="vm-tab" type="button" data-tab="settings">${ICONS.settings}<span>Settings</span></button>
+            <nav class="vm-nav" role="tablist" aria-label="yt-dlp sections">
+              <button class="vm-tab active" id="vm-tab-download" type="button" role="tab" data-tab="download" aria-controls="vm-panel-content">${ICONS.download}<span>Download</span></button>
+              <button class="vm-tab" id="vm-tab-queue" type="button" role="tab" data-tab="queue" aria-controls="vm-panel-content">${ICONS.queue}<span>Queue</span><span class="vm-tab-count" hidden>0</span></button>
+              <button class="vm-tab" id="vm-tab-settings" type="button" role="tab" data-tab="settings" aria-controls="vm-panel-content">${ICONS.settings}<span>Settings</span></button>
             </nav>
           </header>
-          <main class="vm-content"></main>
+          <main class="vm-content" id="vm-panel-content" role="tabpanel" tabindex="0"></main>
         </aside>
         <div class="vm-toast-rack" aria-live="polite"></div>
       </div>`);
@@ -814,6 +923,8 @@
     }
 
     shell = shadow.querySelector('.vm-shell');
+    homeLauncher = shadow.querySelector('.vm-home-launcher');
+    homeLauncherBadge = shadow.querySelector('.vm-home-launcher-badge');
     panel = shadow.querySelector('.vm-panel');
     content = shadow.querySelector('.vm-content');
     connectionBadge = shadow.querySelector('.vm-status');
@@ -821,7 +932,9 @@
     toastRack = shadow.querySelector('.vm-toast-rack');
 
     ensurePlayerButton();
+    content.addEventListener('click', handleQueueActionClick);
     shadow.addEventListener('click', handleShellClick);
+    shadow.addEventListener('keydown', handleTabKeyboard);
     shadow.addEventListener('keydown', stopYouTubeShortcuts);
     shadow.addEventListener('keyup', stopYouTubeShortcuts);
     shadow.addEventListener('keypress', stopYouTubeShortcuts);
@@ -853,7 +966,18 @@
     if (fullscreen && state.open) {
       state.open = false;
       shell.classList.remove('open');
+      playerButton?.setAttribute('aria-expanded', 'false');
     }
+    syncHomepageLauncherVisibility(fullscreen);
+  }
+
+  function syncHomepageLauncherVisibility(fullscreen = isFullscreenActive()) {
+    if (!homeLauncher) return;
+    const visible = isYouTubeHomepage() && !fullscreen && !state.open;
+    homeLauncher.classList.toggle('visible', visible);
+    homeLauncher.tabIndex = visible ? 0 : -1;
+    homeLauncher.setAttribute('aria-hidden', String(!visible));
+    homeLauncher.setAttribute('aria-expanded', String(state.open));
   }
 
   function handleShellClick(event) {
@@ -862,11 +986,16 @@
     const action = target.dataset.action;
     const tab = target.dataset.tab;
     if (tab) {
+      const changed = state.tab !== tab;
       state.tab = tab;
       updateChrome();
-      renderCurrentTab();
+      renderCurrentTab(changed);
       if (tab === 'download') fetchInfo(false);
       if (tab === 'queue') pollJobs(true);
+      return;
+    }
+    if (action === 'open-home-panel') {
+      openPanel('download');
       return;
     }
     if (action === 'close') closePanel();
@@ -877,13 +1006,29 @@
     }
   }
 
+  function handleTabKeyboard(event) {
+    const currentTab = event.target.closest?.('[data-tab]');
+    if (!currentTab || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const tabs = Array.from(shadow.querySelectorAll('[data-tab]'));
+    const currentIndex = tabs.indexOf(currentTab);
+    if (currentIndex < 0) return;
+    event.preventDefault();
+    const nextIndex = event.key === 'Home'
+      ? 0
+      : event.key === 'End'
+        ? tabs.length - 1
+        : (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+    tabs[nextIndex].click();
+    tabs[nextIndex].focus({ preventScroll: true });
+  }
+
   function openPanel(tab = null) {
     if (isFullscreenActive()) return;
     if (tab) state.tab = tab;
     state.open = true;
     shell.classList.add('open');
     updateChrome();
-    renderCurrentTab();
+    renderCurrentTab(true);
     if (state.tab === 'download') fetchInfo(false);
     if (state.tab === 'queue') pollJobs(true);
     panel.querySelector('button')?.focus({ preventScroll: true });
@@ -893,12 +1038,20 @@
     state.open = false;
     shell.classList.remove('open');
     playerButton?.setAttribute('aria-expanded', 'false');
-    if (playerButton?.isConnected && !playerButton.hidden) playerButton.focus({ preventScroll: true });
+    syncHomepageLauncherVisibility();
+    if (homeLauncher?.classList.contains('visible')) homeLauncher.focus({ preventScroll: true });
+    else if (playerButton?.isConnected && !playerButton.hidden) playerButton.focus({ preventScroll: true });
   }
 
   function updateChrome() {
     if (!shadow) return;
-    shadow.querySelectorAll('.vm-tab').forEach((button) => button.classList.toggle('active', button.dataset.tab === state.tab));
+    shadow.querySelectorAll('.vm-tab').forEach((button) => {
+      const active = button.dataset.tab === state.tab;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+      button.tabIndex = active ? 0 : -1;
+      if (active) content?.setAttribute('aria-labelledby', button.id);
+    });
     connectionBadge.className = `vm-status ${state.connection === 'ready' ? 'ready' : state.connection === 'offline' ? 'offline' : ''}`;
     const label = connectionBadge.querySelector('.vm-status-label');
     label.textContent = state.connection === 'ready'
@@ -917,13 +1070,29 @@
       playerButtonBadge.classList.toggle('resume', activeCount === 0 && resumableCount > 0);
       playerButtonBadge.textContent = String(attentionCount);
     }
+    if (homeLauncherBadge) {
+      homeLauncherBadge.classList.toggle('visible', attentionCount > 0);
+      homeLauncherBadge.classList.toggle('resume', activeCount === 0 && resumableCount > 0);
+      homeLauncherBadge.textContent = String(attentionCount);
+    }
+    syncHomepageLauncherVisibility();
   }
 
-  function renderCurrentTab() {
+  function animateContentChange(className = 'vm-view-enter') {
+    if (!content) return;
+    clearTimeout(viewAnimationTimer);
+    content.classList.remove('vm-view-enter', 'vm-view-refresh');
+    void content.offsetWidth;
+    content.classList.add(className);
+    viewAnimationTimer = setTimeout(() => content?.classList.remove(className), 360);
+  }
+
+  function renderCurrentTab(animate = false) {
     if (!content) return;
     if (state.tab === 'download') renderDownload();
     else if (state.tab === 'queue') renderQueue();
     else renderSettings();
+    if (animate) animateContentChange();
   }
 
   async function testConnection(showResult = false) {
@@ -1331,6 +1500,7 @@
         state.form.downloadMode = button.dataset.downloadMode;
         ensureExactFormat();
         renderDownload();
+        animateContentChange('vm-view-refresh');
       });
     });
     content.querySelectorAll('[data-field]').forEach((input) => {
@@ -1340,6 +1510,7 @@
         if (field === 'selectionType' || field === 'exactFormatId' || field === 'audioCodec' || field === 'subtitleMode' || field === 'writeThumbnail' || field === 'embedThumbnail' || field === 'mergeVideoFormatId' || field === 'mergeAudioFormatId') {
           ensureExactFormat();
           renderDownload();
+          animateContentChange('vm-view-refresh');
         }
       });
     });
@@ -1434,70 +1605,261 @@
     }
   }
 
-  function renderQueue() {
+  function jobViewModel(job) {
+    const progress = job.progress || {};
+    const percent = job.status === 'completed' ? 100 : Math.max(0, Math.min(100, Number(progress.percent) || 0));
+    const logs = (job.logs || []).slice(-20).join('\n');
+    const attempt = Number(job.attempt) || 0;
+    const maxAttempts = Number(job.max_attempts) || 1;
+    return {
+      percent,
+      percentText: percent ? `${percent.toFixed(percent >= 10 ? 0 : 1)}%` : '0%',
+      size: progress.downloaded_bytes ? `${formatBytes(progress.downloaded_bytes)}${progress.total_bytes ? ` / ${formatBytes(progress.total_bytes)}` : ''}` : '',
+      speed: progress.speed ? `Avg ${formatBytes(progress.speed)}/s` : '',
+      eta: progress.eta != null ? `ETA ${formatDuration(progress.eta)}` : '',
+      detailText: job.error || logs,
+      detailLabel: job.error ? 'Error details' : 'yt-dlp log',
+      canPause: ACTIVE_STATUSES.has(job.status),
+      canResume: job.resumable === true || RESUMABLE_STATUSES.has(job.status),
+      attemptText: maxAttempts > 1 && attempt > 0 ? `Attempt ${attempt}/${maxAttempts}` : '',
+      modeText: {
+        video: 'Video only',
+        audio: 'Audio only',
+        merge: 'Merged A/V',
+      }[job.download_mode] || (job.media_type === 'audio' ? 'Audio only' : 'Merged A/V'),
+    };
+  }
+
+  function jobStructureKey(job, view = jobViewModel(job)) {
+    return [
+      Boolean(job.thumbnail),
+      Boolean(job.output_path),
+      Boolean(view.detailText),
+      Boolean(job.error),
+      view.canPause,
+      view.canResume,
+    ].map(Number).join(':');
+  }
+
+  function queueViewModel() {
     const active = state.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)).length;
     const completed = state.jobs.filter((job) => job.status === 'completed').length;
     const resumable = state.jobs.filter((job) => job.resumable === true || RESUMABLE_STATUSES.has(job.status)).length;
+    return {
+      title: active ? `${active} active download${active === 1 ? '' : 's'}` : resumable ? `${resumable} ready to resume` : 'Queue is idle',
+      meta: `${completed} completed · ${resumable} resumable · ${state.jobs.length} total`,
+    };
+  }
+
+  function captureLogPosition(details) {
+    const pre = details?.querySelector('pre');
+    if (!pre) return null;
+    return {
+      top: pre.scrollTop,
+      stickToBottom: pre.scrollHeight - pre.clientHeight - pre.scrollTop < 10,
+    };
+  }
+
+  function captureQueueViewState() {
+    if (!content?.querySelector('.vm-queue-view')) return null;
+    const logPositions = new Map();
+    content.querySelectorAll('[data-job-details]').forEach((details) => {
+      const position = captureLogPosition(details);
+      if (position) logPositions.set(details.dataset.jobDetails, position);
+    });
+    return { contentScrollTop: content.scrollTop, logPositions };
+  }
+
+  function bindJobDetails(details, savedPosition = null) {
+    if (!details || details.dataset.bound === 'true') return;
+    details.dataset.bound = 'true';
+    const jobId = details.dataset.jobDetails;
+    const pre = details.querySelector('pre');
+    details.querySelector('summary')?.addEventListener('click', () => {
+      if (details.open) return;
+      details.classList.remove('just-opened');
+      void details.offsetWidth;
+      details.classList.add('just-opened');
+      setTimeout(() => details.classList.remove('just-opened'), 220);
+    });
+    details.addEventListener('toggle', () => {
+      if (details.open) {
+        state.expandedJobDetails.add(jobId);
+        if (pre && !savedPosition) requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+      } else {
+        state.expandedJobDetails.delete(jobId);
+      }
+    });
+    if (pre && details.open) {
+      requestAnimationFrame(() => {
+        pre.scrollTop = savedPosition?.stickToBottom ? pre.scrollHeight : savedPosition?.top ?? pre.scrollHeight;
+      });
+    }
+  }
+
+  function bindQueueHandlers(previousView) {
+    content.querySelectorAll('[data-job-details]').forEach((details) => {
+      bindJobDetails(details, previousView?.logPositions.get(details.dataset.jobDetails));
+    });
+    if (previousView) {
+      content.scrollTop = previousView.contentScrollTop;
+      requestAnimationFrame(() => { content.scrollTop = previousView.contentScrollTop; });
+    }
+  }
+
+  function handleQueueActionClick(event) {
+    const button = event.target.closest?.('button');
+    if (!button) return;
+    if (button.dataset.cancelJob) void cancelJob(button.dataset.cancelJob);
+    else if (button.dataset.resumeJob) void resumeJob(button.dataset.resumeJob);
+    else if (button.dataset.forgetJob) void forgetJob(button.dataset.forgetJob);
+    else if (button.dataset.action === 'clear-jobs') void clearJobs();
+  }
+
+  function renderJobStats(view) {
+    return `<span data-job-stat="percent">${h(view.percentText)}</span>
+      <span data-job-stat="mode">${h(view.modeText)}</span>
+      <span data-job-stat="attempt" ${view.attemptText ? '' : 'hidden'}>${h(view.attemptText)}</span>
+      <span data-job-stat="size" ${view.size ? '' : 'hidden'}>${h(view.size)}</span>
+      <span data-job-stat="speed" ${view.speed ? '' : 'hidden'}>${h(view.speed)}</span>
+      <span class="spacer"></span>
+      <span data-job-stat="eta" ${view.eta ? '' : 'hidden'}>${h(view.eta)}</span>`;
+  }
+
+  function setJobStat(card, name, value) {
+    const element = card.querySelector(`[data-job-stat="${name}"]`);
+    if (!element) return;
+    element.hidden = !value;
+    if (value && element.textContent !== value) element.textContent = value;
+  }
+
+  function updateLogText(pre, nextText) {
+    const textNode = pre.firstChild;
+    if (textNode?.nodeType === 3 && pre.childNodes.length === 1) textNode.data = nextText;
+    else pre.textContent = nextText;
+  }
+
+  function updateJobCard(card, job) {
+    const view = jobViewModel(job);
+    card.className = `vm-job vm-card ${job.status}`;
+    card.dataset.jobStructure = jobStructureKey(job, view);
+    const title = card.querySelector('.vm-job-title');
+    if (title && title.textContent !== job.title) {
+      title.textContent = job.title;
+      title.title = job.title;
+    }
+    const thumbnail = card.querySelector('.vm-job-thumb img');
+    if (thumbnail && thumbnail.getAttribute('src') !== job.thumbnail) thumbnail.setAttribute('src', job.thumbnail);
+    const phaseIconElement = card.querySelector('.vm-job-phase-icon');
+    if (phaseIconElement && phaseIconElement.dataset.status !== job.status) {
+      replaceMarkup(phaseIconElement, phaseIcon(job.status));
+      phaseIconElement.dataset.status = job.status;
+    }
+    const phaseText = card.querySelector('.vm-job-phase-text');
+    const nextPhase = job.phase || job.status;
+    if (phaseText && phaseText.textContent !== nextPhase) phaseText.textContent = nextPhase;
+    const progressBar = card.querySelector('.vm-progress-bar');
+    if (progressBar) progressBar.style.width = `${view.percent.toFixed(2)}%`;
+    setJobStat(card, 'percent', view.percentText);
+    setJobStat(card, 'mode', view.modeText);
+    setJobStat(card, 'attempt', view.attemptText);
+    setJobStat(card, 'size', view.size);
+    setJobStat(card, 'speed', view.speed);
+    setJobStat(card, 'eta', view.eta);
+    const outputPath = card.querySelector('.vm-path');
+    if (outputPath && outputPath.textContent !== job.output_path) outputPath.textContent = job.output_path;
+    const details = card.querySelector('[data-job-details]');
+    const pre = details?.querySelector('pre');
+    if (details && pre && pre.textContent !== view.detailText) {
+      const position = captureLogPosition(details);
+      updateLogText(pre, view.detailText);
+      if (position?.stickToBottom) requestAnimationFrame(() => { pre.scrollTop = pre.scrollHeight; });
+      else if (position) pre.scrollTop = position.top;
+    }
+  }
+
+  function updateQueueView() {
+    const queueView = content?.querySelector('.vm-queue-view');
+    if (!queueView || !state.jobs.length) return false;
+    const cards = Array.from(queueView.querySelectorAll('[data-job-id]'));
+    if (cards.length !== state.jobs.length) return false;
+    if (cards.some((card, index) => card.dataset.jobId !== state.jobs[index].id)) return false;
+    const plans = cards.map((card, index) => {
+      const job = state.jobs[index];
+      const view = jobViewModel(job);
+      if (card.dataset.jobStructure === jobStructureKey(job, view)) return { card, job, replace: false, replacement: null, savedPosition: null };
+      const details = card.querySelector('[data-job-details]');
+      if (details?.open) state.expandedJobDetails.add(job.id);
+      return {
+        card,
+        job,
+        replace: true,
+        replacement: elementFromMarkup(renderJob(job)),
+        savedPosition: captureLogPosition(details),
+      };
+    });
+    if (plans.some((plan) => plan.replace && !plan.replacement)) return false;
+    const contentScrollTop = content.scrollTop;
+    for (const plan of plans) {
+      if (plan.replace) {
+        plan.card.replaceWith(plan.replacement);
+        bindJobDetails(plan.replacement.querySelector('[data-job-details]'), plan.savedPosition);
+      } else {
+        updateJobCard(plan.card, plan.job);
+      }
+    }
+    const queue = queueViewModel();
+    const title = queueView.querySelector('[data-queue-title]');
+    const meta = queueView.querySelector('[data-queue-meta]');
+    if (title && title.textContent !== queue.title) title.textContent = queue.title;
+    if (meta && meta.textContent !== queue.meta) meta.textContent = queue.meta;
+    content.scrollTop = contentScrollTop;
+    return true;
+  }
+
+  function renderQueue() {
+    const previousView = captureQueueViewState();
+    const currentJobIds = new Set(state.jobs.map((job) => job.id));
+    for (const jobId of state.expandedJobDetails) {
+      if (!currentJobIds.has(jobId)) state.expandedJobDetails.delete(jobId);
+    }
     if (!state.jobs.length) {
       replaceMarkup(content, emptyState(ICONS.queue, 'Your queue is empty', 'Add a download here. If the companion restarts mid-download, its recovery record will appear here with a Resume button.', 'Choose a download', 'open-download'));
       bindEmptyActions();
       return;
     }
+    const queue = queueViewModel();
     replaceMarkup(content, `
-      <div class="vm-queue-head">
-        <div class="vm-queue-summary"><strong>${active ? `${active} active download${active === 1 ? '' : 's'}` : resumable ? `${resumable} ready to resume` : 'Queue is idle'}</strong><span>${completed} completed · ${resumable} resumable · ${state.jobs.length} total</span></div>
-        <button class="vm-secondary danger" type="button" data-action="clear-jobs">${ICONS.trash} Clear completed</button>
-      </div>
-      <div>${state.jobs.map(renderJob).join('')}</div>
-      <div class="vm-footer">Recovered downloads stay paused until you choose Resume. The queue runs sequentially to reduce YouTube rate-limit pressure.</div>`);
-    content.querySelector('[data-action="clear-jobs"]')?.addEventListener('click', clearJobs);
-    content.querySelectorAll('[data-cancel-job]').forEach((button) => button.addEventListener('click', () => cancelJob(button.dataset.cancelJob)));
-    content.querySelectorAll('[data-resume-job]').forEach((button) => button.addEventListener('click', () => resumeJob(button.dataset.resumeJob)));
-    content.querySelectorAll('[data-forget-job]').forEach((button) => button.addEventListener('click', () => forgetJob(button.dataset.forgetJob)));
+      <div class="vm-queue-view">
+        <div class="vm-queue-head">
+          <div class="vm-queue-summary"><strong data-queue-title>${h(queue.title)}</strong><span data-queue-meta>${h(queue.meta)}</span></div>
+          <button class="vm-secondary danger" type="button" data-action="clear-jobs">${ICONS.trash} Clear completed</button>
+        </div>
+        <div>${state.jobs.map(renderJob).join('')}</div>
+        <div class="vm-footer">Paused and recovered downloads stay resumable until you choose Resume. The queue runs sequentially to reduce YouTube rate-limit pressure.</div>
+      </div>`);
+    bindQueueHandlers(previousView);
   }
 
   function renderJob(job) {
-    const progress = job.progress || {};
-    const percent = job.status === 'completed' ? 100 : Math.max(0, Math.min(100, Number(progress.percent) || 0));
-    const size = progress.downloaded_bytes ? `${formatBytes(progress.downloaded_bytes)}${progress.total_bytes ? ` / ${formatBytes(progress.total_bytes)}` : ''}` : '';
-    const speed = progress.speed ? `${formatBytes(progress.speed)}/s` : '';
-    const eta = progress.eta != null ? `ETA ${formatDuration(progress.eta)}` : '';
-    const logs = (job.logs || []).slice(-20).join('\n');
-    const canCancel = ACTIVE_STATUSES.has(job.status);
-    const canResume = job.resumable === true || RESUMABLE_STATUSES.has(job.status);
-    const attempt = Number(job.attempt) || 0;
-    const maxAttempts = Number(job.max_attempts) || 1;
-    const attemptText = maxAttempts > 1 && attempt > 0 ? `Attempt ${attempt}/${maxAttempts}` : '';
-    const modeText = {
-      video: 'Video only',
-      audio: 'Audio only',
-      merge: 'Merged A/V',
-    }[job.download_mode] || (job.media_type === 'audio' ? 'Audio only' : 'Merged A/V');
-    return `<article class="vm-job vm-card ${h(job.status)}">
+    const view = jobViewModel(job);
+    return `<article class="vm-job vm-card ${h(job.status)}" data-job-id="${h(job.id)}" data-job-structure="${jobStructureKey(job, view)}">
       <div class="vm-job-top">
         <div class="vm-job-thumb">${job.thumbnail ? `<img src="${h(job.thumbnail)}" alt="" referrerpolicy="no-referrer">` : ''}</div>
         <div class="vm-job-main">
           <div class="vm-job-title" title="${h(job.title)}">${h(job.title)}</div>
-          <div class="vm-job-phase">${phaseIcon(job.status)}<span>${h(job.phase || job.status)}</span></div>
+          <div class="vm-job-phase"><span class="vm-job-phase-icon" data-status="${h(job.status)}">${phaseIcon(job.status)}</span><span class="vm-job-phase-text">${h(job.phase || job.status)}</span></div>
         </div>
         <div class="vm-job-actions">
-          ${canResume ? `<button class="vm-job-action resume" type="button" data-resume-job="${h(job.id)}" aria-label="Resume download">${ICONS.refresh}<span>Resume</span></button>` : ''}
-          ${canResume ? `<button class="vm-job-action" type="button" data-forget-job="${h(job.id)}" aria-label="Forget recovery record" title="Forget recovery record; partial files stay on disk">${ICONS.trash}</button>` : ''}
-          ${canCancel ? `<button class="vm-job-action" type="button" data-cancel-job="${h(job.id)}" aria-label="Cancel download">${ICONS.stop}</button>` : ''}
+          ${view.canResume ? `<button class="vm-job-action resume" type="button" data-resume-job="${h(job.id)}" aria-label="Resume download">${ICONS.refresh}<span>Resume</span></button>` : ''}
+          ${view.canResume ? `<button class="vm-job-action" type="button" data-forget-job="${h(job.id)}" aria-label="Forget recovery record" title="Forget recovery record; partial files stay on disk">${ICONS.trash}</button>` : ''}
+          ${view.canPause ? `<button class="vm-job-action pause" type="button" data-cancel-job="${h(job.id)}" aria-label="Pause download" title="Pause download">${ICONS.pause}</button>` : ''}
         </div>
       </div>
-      <div class="vm-progress-track"><div class="vm-progress-bar" style="width:${percent.toFixed(2)}%"></div></div>
-      <div class="vm-job-stats">
-        <span>${percent ? `${percent.toFixed(percent >= 10 ? 0 : 1)}%` : '0%'}</span>
-        <span>${h(modeText)}</span>
-        ${attemptText ? `<span>${h(attemptText)}</span>` : ''}
-        ${size ? `<span>${size}</span>` : ''}
-        ${speed ? `<span>${speed}</span>` : ''}
-        <span class="spacer"></span>
-        ${eta ? `<span>${eta}</span>` : ''}
-      </div>
+      <div class="vm-progress-track"><div class="vm-progress-bar" style="width:${view.percent.toFixed(2)}%"></div></div>
+      <div class="vm-job-stats">${renderJobStats(view)}</div>
       ${job.output_path ? `<div class="vm-path">${h(job.output_path)}</div>` : ''}
-      ${job.error || logs ? `<details class="vm-details"><summary>${job.error ? 'Error details' : 'yt-dlp log'}</summary><pre>${h(job.error || logs)}</pre></details>` : ''}
+      ${view.detailText ? `<details class="vm-details" data-job-details="${h(job.id)}" ${state.expandedJobDetails.has(job.id) ? 'open' : ''}><summary>${h(view.detailLabel)}</summary><pre>${h(view.detailText)}</pre></details>` : ''}
     </article>`;
   }
 
@@ -1515,12 +1877,12 @@
         if (oldStatus && !TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(job.status) && !state.notified.has(`${job.id}:${job.status}`)) {
           state.notified.add(`${job.id}:${job.status}`);
           const failed = job.status === 'failed';
-          toast(failed ? `Download failed: ${job.title}` : job.status === 'completed' ? `Download complete: ${job.title}` : `Download cancelled: ${job.title}`, failed);
+          toast(failed ? `Download failed: ${job.title}` : job.status === 'completed' ? `Download complete: ${job.title}` : `Download paused: ${job.title}`, failed);
           if (state.settings.notifications && job.status !== 'cancelled') notifyJob(job);
         }
       }
       updateChrome();
-      if ((forceRender || state.tab === 'queue') && state.open) renderQueue();
+      if ((forceRender || state.tab === 'queue') && state.open && !updateQueueView()) renderQueue();
     } catch (error) {
       if (error.code === 'connection_failed' || error.status === 401) {
         state.connection = 'offline';
@@ -1548,7 +1910,7 @@
   async function cancelJob(jobId) {
     try {
       await apiRequest('POST', `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {});
-      toast('Cancelling download…');
+      toast('Pausing download…');
       await pollJobs(true);
     } catch (error) {
       toast(error.message, true);
@@ -1760,11 +2122,11 @@
       if (action === 'open-settings') {
         state.tab = 'settings';
         updateChrome();
-        renderSettings();
+        renderCurrentTab(true);
       } else if (action === 'open-download') {
         state.tab = 'download';
         updateChrome();
-        renderDownload();
+        renderCurrentTab(true);
       } else if (action === 'retry-info') {
         fetchInfo(true);
       }
@@ -1784,6 +2146,7 @@
   function watchNavigation() {
     const handle = () => {
       ensurePlayerButton();
+      syncHomepageLauncherVisibility();
       if (location.href === state.lastUrl) return;
       state.lastUrl = location.href;
       const nextUrl = currentVideoUrl();

@@ -1,3 +1,31 @@
+# Version 1.7.1
+
+Live-log rendering hotfix.
+
+- Stopped rebuilding the complete Queue DOM on every active-download poll
+- Updated progress, status, speed, ETA, and log text directly inside existing job cards
+- Preserved the same open `<details>` and `<pre>` elements so log position, selection, focus, and scroll do not flicker
+- Limited full card reconstruction to actual structural changes such as Pause becoming Resume or an output path appearing
+- Restricted the log reveal animation to deliberate user opening instead of background refreshes
+- Added no-flicker userscript regression contracts while retaining all v1.7.0 behavior
+
+Run the updater or installer and reinstall the newly generated paired userscript. Existing settings, pairing tokens, queued jobs, and recovery records remain compatible.
+
+# Version 1.7.0
+
+Queue-state, progress, navigation, and visual-polish update.
+
+- Kept opened yt-dlp logs open during live Queue polling, including their panel and log scroll positions
+- Restored the red floating launcher on the YouTube homepage while retaining the white/red-glow player control on video pages
+- Replaced the active-job stop glyph and user-facing cancellation wording with a clear pause (`||`) action; paused jobs remain resumable
+- Changed displayed speed to an observed average based on bytes transferred over elapsed time instead of yt-dlp's instantaneous estimate
+- Added clear muted styling and unavailable cursors to disabled selects, inputs, and switches
+- Added restrained tab/content/log transitions with automatic `prefers-reduced-motion` support
+- Improved tab semantics, keyboard arrow navigation, focus indicators, and launcher accessibility state
+- Added regression coverage for the new UI contracts and average-speed calculation
+
+Run the updater or installer and reinstall the newly generated paired userscript. Existing settings, pairing tokens, queued jobs, and recovery records remain compatible.
+
 # Version 1.6.2
 
 Native player-icon visual refinement.

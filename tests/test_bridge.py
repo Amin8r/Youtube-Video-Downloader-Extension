@@ -415,6 +415,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(current["progress"]["percent"], 100.0)
         self.assertTrue(current["output_path"].endswith(".mp4"))
 
+    def test_progress_speed_is_observed_bytes_over_elapsed_time(self) -> None:
+        jobs = bridge.JobManager(self.runner)
+        self.addCleanup(jobs.stop)
+        options = bridge.validate_job_payload(base_job())
+        job = jobs._new_job("a" * 32, options)
+        with mock.patch.object(bridge.time, "monotonic", side_effect=[10.0, 12.0, 14.0]):
+            jobs._consume_progress(job, "250|1000|NA|999999|8|1|4")
+            self.assertIsNone(job["progress"]["speed"])
+            jobs._consume_progress(job, "750|1000|NA|999999|2|3|4")
+            self.assertEqual(job["progress"]["speed"], 250.0)
+            jobs._consume_progress(job, "100|1000|NA|999999|7|1|4")
+        self.assertEqual(job["progress"]["speed"], 150.0)
+        self.assertEqual(job["progress"]["elapsed_seconds"], 4.0)
+        public = jobs._public_job(job)
+        self.assertFalse(any(key.startswith("_") for key in public))
+
     def test_active_job_can_be_cancelled(self) -> None:
         jobs = bridge.JobManager(self.runner)
         self.addCleanup(jobs.stop)
@@ -435,6 +451,8 @@ class RunnerTests(unittest.TestCase):
                 break
             time.sleep(0.03)
         self.assertEqual(current["status"], "cancelled", current)
+        self.assertEqual(current["phase"], "Paused")
+        self.assertTrue(current["resumable"])
 
     def test_transient_failure_retries_and_then_completes(self) -> None:
         request = base_job()
@@ -528,7 +546,7 @@ class PairingTests(unittest.TestCase):
             self.assertNotIn("__VM_YTDLP_API_BASE__", source)
             self.assertIn(config.token, source)
             self.assertIn("http://127.0.0.1:18443", source)
-            self.assertIn("// @version      1.6.2", source)
+            self.assertIn("// @version      1.7.1", source)
             self.assertIn("BOOTSTRAP_TOKEN.length >= 32", source)
 
 
@@ -573,7 +591,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(context.exception.code, 401)
         status, payload = self.request("GET", "/api/v1/health")
         self.assertEqual(status, 200)
-        self.assertEqual(payload["version"], "1.6.2")
+        self.assertEqual(payload["version"], "1.7.1")
         self.assertEqual(payload["yt_dlp_version"], "2026.fake")
         self.assertIn("proxy", payload["capabilities"])
         self.assertIn("invalid_certificates", payload["capabilities"])

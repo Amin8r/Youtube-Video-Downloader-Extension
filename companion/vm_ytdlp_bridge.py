@@ -36,7 +36,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 APP_NAME = "yt-dlp for Violentmonkey Bridge"
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.7.1"
 API_VERSION = 1
 DEFAULT_PORT = 17442
 MAX_BODY_BYTES = 64 * 1024
@@ -962,9 +962,9 @@ class JobManager:
                 return self._public_job(job)
             job["cancel_requested"] = True
             if job["status"] == "queued":
-                self._set_terminal(job, "cancelled", "Cancelled")
+                self._set_terminal(job, "cancelled", "Paused")
             elif self._active_job_id == job_id:
-                job["phase"] = "Cancelling…"
+                job["phase"] = "Pausing…"
                 self._touch(job)
                 process = self._active_process
             snapshot = self._public_job(job)
@@ -980,7 +980,7 @@ class JobManager:
                 raise BridgeError("Job not found.", code="job_not_found", status=HTTPStatus.NOT_FOUND)
             if job["status"] not in RESUMABLE_STATUSES:
                 raise BridgeError(
-                    "Only interrupted, failed, or cancelled downloads can be resumed.",
+                    "Only interrupted, failed, or paused downloads can be resumed.",
                     code="job_not_resumable",
                     status=HTTPStatus.CONFLICT,
                 )
@@ -995,7 +995,11 @@ class JobManager:
             job["error"] = None
             job["cancel_requested"] = False
             job["progress"]["speed"] = None
+            job["progress"]["elapsed_seconds"] = None
             job["progress"]["eta"] = None
+            job["_speed_started_monotonic"] = None
+            job["_speed_last_downloaded_bytes"] = None
+            job["_speed_accumulated_bytes"] = 0.0
             job["logs"].append("[bridge] Resume requested; yt-dlp will continue compatible partial files.")
             try:
                 self._save_recovery_manifest(job)
@@ -1069,6 +1073,7 @@ class JobManager:
                 "downloaded_bytes": None,
                 "total_bytes": None,
                 "speed": None,
+                "elapsed_seconds": None,
                 "eta": None,
                 "fragment_index": None,
                 "fragment_count": None,
@@ -1078,6 +1083,9 @@ class JobManager:
             "logs": ["[bridge] Recovered after the companion restarted."] if recovered else [],
             "cancel_requested": False,
             "recovered": recovered,
+            "_speed_started_monotonic": None,
+            "_speed_last_downloaded_bytes": None,
+            "_speed_accumulated_bytes": 0.0,
             "options": dict(options),
         }
 
@@ -1214,12 +1222,17 @@ class JobManager:
                     if job is None:
                         return
                     if job["cancel_requested"] or self._stopping:
-                        self._set_terminal(job, "cancelled", "Cancelled")
+                        self._set_terminal(job, "cancelled", "Paused")
                         return
                     job["attempt"] = attempt
                     job["status"] = "starting"
                     job["phase"] = "Starting yt-dlp"
                     job["error"] = None
+                    job["progress"]["speed"] = None
+                    job["progress"]["elapsed_seconds"] = None
+                    job["_speed_started_monotonic"] = None
+                    job["_speed_last_downloaded_bytes"] = None
+                    job["_speed_accumulated_bytes"] = 0.0
                     self._touch(job)
 
                 return_code, start_error = self._run_process_attempt(job_id, options, command)
@@ -1229,7 +1242,7 @@ class JobManager:
                     if job is None:
                         return
                     if job["cancel_requested"] or self._stopping:
-                        self._set_terminal(job, "cancelled", "Cancelled")
+                        self._set_terminal(job, "cancelled", "Paused")
                         return
                     if return_code == 0:
                         job["progress"]["percent"] = 100.0
@@ -1264,7 +1277,7 @@ class JobManager:
                     with self._lock:
                         job = self._jobs.get(job_id)
                         if job and job["status"] not in TERMINAL_STATUSES:
-                            self._set_terminal(job, "cancelled", "Cancelled")
+                            self._set_terminal(job, "cancelled", "Paused")
                     return
         finally:
             with self._lock:
@@ -1372,7 +1385,7 @@ class JobManager:
 
         downloaded = number(0)
         total = number(1) or number(2)
-        speed = number(3)
+        _reported_speed = number(3)
         eta = number(4)
         fragment_index = number(5)
         fragment_count = number(6)
@@ -1382,12 +1395,35 @@ class JobManager:
         elif fragment_index is not None and fragment_count:
             percent = min(100.0, max(0.0, float(fragment_index) / float(fragment_count) * 100))
         progress = job["progress"]
+        average_speed: float | None = None
+        elapsed_seconds: float | None = None
+        if downloaded is not None:
+            now = time.monotonic()
+            current_downloaded = max(0.0, float(downloaded))
+            started = job.get("_speed_started_monotonic")
+            previous_downloaded = job.get("_speed_last_downloaded_bytes")
+            if started is None or previous_downloaded is None:
+                job["_speed_started_monotonic"] = now
+                job["_speed_last_downloaded_bytes"] = current_downloaded
+                job["_speed_accumulated_bytes"] = 0.0
+            else:
+                delta = current_downloaded - float(previous_downloaded)
+                if delta < 0:
+                    # Separate video/audio streams restart yt-dlp's byte counter.
+                    delta = current_downloaded
+                accumulated = float(job.get("_speed_accumulated_bytes") or 0.0) + max(0.0, delta)
+                job["_speed_accumulated_bytes"] = accumulated
+                job["_speed_last_downloaded_bytes"] = current_downloaded
+                elapsed_seconds = max(0.0, now - float(started))
+                if elapsed_seconds > 0 and accumulated > 0:
+                    average_speed = accumulated / elapsed_seconds
         progress.update(
             {
                 "percent": round(percent, 2),
                 "downloaded_bytes": downloaded,
                 "total_bytes": total,
-                "speed": speed,
+                "speed": round(average_speed, 2) if average_speed is not None else None,
+                "elapsed_seconds": round(elapsed_seconds, 2) if elapsed_seconds is not None else None,
                 "eta": eta,
                 "fragment_index": fragment_index,
                 "fragment_count": fragment_count,
@@ -1418,7 +1454,13 @@ class JobManager:
         self._revision += 1
 
     def _public_job(self, job: Mapping[str, Any]) -> dict[str, Any]:
-        public = copy.deepcopy({key: value for key, value in job.items() if key not in {"options", "cancel_requested"}})
+        public = copy.deepcopy(
+            {
+                key: value
+                for key, value in job.items()
+                if key not in {"options", "cancel_requested"} and not str(key).startswith("_")
+            }
+        )
         public["resumable"] = job["status"] in RESUMABLE_STATUSES
         return public
 

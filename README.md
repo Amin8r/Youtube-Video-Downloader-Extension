@@ -1,6 +1,6 @@
 # yt-dlp for Violentmonkey
 
-An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` running on your own computer. A download control inside YouTube's player opens the polished download panel, while extraction, browser-cookie access, merging, post-processing, and file writing remain in a loopback-only companion process.
+An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` running on your own computer. A download control inside YouTube's player—or the red launcher on the YouTube homepage—opens the polished download panel, while extraction, browser-cookie access, merging, post-processing, and file writing remain in a loopback-only companion process.
 
 ## What is included
 
@@ -10,7 +10,7 @@ An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` 
 - MP4, MKV, WebM, MP3, M4A, Opus, FLAC, and WAV output choices
 - Manual and automatic subtitles, language patterns, SRT/WebVTT conversion, and optional embedding
 - Thumbnail download/embedding, metadata JSON, description files, chapters, and embedded tags
-- Sequential queue with live percentage, transferred size, speed, ETA, logs, cancellation, and desktop notifications
+- Sequential queue with live percentage, transferred size, average speed, ETA, flicker-free persistent logs, resumable pausing, and desktop notifications
 - Layered retry handling for requests, fragments, file access, extraction, and complete failed jobs, with resumable partial files
 - Persistent recovery records that rediscover interrupted jobs after the companion or computer restarts
 - Final-only merging: successful video/audio inputs are removed after ffmpeg creates the combined media file
@@ -19,7 +19,9 @@ An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` 
 - Optional self-signed/invalid TLS certificate support, disabled by default with an in-panel security warning
 - YouTube SPA, Shorts, live-video, mobile YouTube, and YouTube Music watch-page support
 - Compact white YouTube-style download button with a red hover glow, mounted directly in the player's right-side controls between its settings and theater/fullscreen groups
+- Red floating homepage launcher for opening the panel when no video player is present
 - Automatic download-button and panel hiding while the YouTube player is in fullscreen mode
+- Muted unavailable controls, keyboard-friendly tabs, restrained transitions, and reduced-motion support
 - Keyboard isolation so typing proxy addresses or other settings cannot trigger YouTube shortcuts such as Theater mode
 - Firefox and Chromium support through Violentmonkey
 
@@ -52,7 +54,7 @@ This is the recommended path for Ubuntu, Debian, Fedora, Arch, and other systemd
    ```
 
 3. The installer creates `yt-dlp-for-violentmonkey.paired.user.js` beside itself. Open the Violentmonkey dashboard and install that file.
-4. Open a YouTube video and click the white download button inside the right-side player controls, between settings and theater/fullscreen. It glows red when hovered.
+4. Open a YouTube video and click the white download button inside the right-side player controls, between settings and theater/fullscreen. It glows red when hovered. On the YouTube homepage, use the red floating launcher instead.
 
 The bridge starts automatically in your user session. Downloads go to `~/Downloads/YouTube` by default.
 
@@ -126,7 +128,7 @@ This setting disables certificate validation for every HTTPS request in that yt-
 
 The **Reliability → Automatic job retries** control chooses how many times the companion restarts a job after yt-dlp exits unsuccessfully. The default is two retries, for three total attempts; you can choose zero through five retries. The queue shows the current attempt and uses an increasing delay between attempts.
 
-Each attempt also enables yt-dlp's own HTTP, fragment, file-access, and extractor retries with exponential delays. Compatible partial downloads remain as `.part` files and the next attempt uses the same output name, allowing yt-dlp to continue instead of discarding already downloaded data. Cancellation still stops the job immediately, including while it is waiting to retry.
+Each attempt also enables yt-dlp's own HTTP, fragment, file-access, and extractor retries with exponential delays. Compatible partial downloads remain as `.part` files and the next attempt uses the same output name, allowing yt-dlp to continue instead of discarding already downloaded data. Pause stops the active process immediately—even during retry backoff—while retaining its recovery record for Resume.
 
 The companion writes a small recovery record for each queued job under the download folder's hidden `.vm-yt-dlp-resume` directory. If the browser, bridge, or computer stops before completion, the next bridge launch discovers that record and shows the job in the Queue as **Ready to resume**. Resume is always manual: choose **Resume** and yt-dlp runs with `--continue` against the existing `.part` files. A successful job removes its recovery record automatically.
 
@@ -202,7 +204,7 @@ Common causes:
 - Certificate validation bypass is a typed, default-off setting; arbitrary yt-dlp arguments are still rejected.
 - Raw yt-dlp arguments are never accepted.
 - yt-dlp is launched with `shell=False` semantics and an argument array.
-- Cancellation terminates the complete yt-dlp/ffmpeg process group.
+- Pausing terminates the complete yt-dlp/ffmpeg process group while retaining compatible partial data for Resume.
 - Recovery manifests are schema-validated before use, use owner-only permissions where supported, and never retain proxy credentials or browser-cookie settings.
 - The paired userscript contains the local token. Treat that file as private and do not publish it.
 
@@ -210,7 +212,7 @@ Any local process running as your operating-system user can generally access you
 
 ## Queue behavior
 
-Jobs run one at a time. This makes progress easier to understand and reduces concurrent pressure on YouTube. Completed history remains in memory, while unfinished jobs have persistent recovery records and return as paused Queue entries after a restart. Failed and cancelled jobs can also be resumed manually. **Forget recovery record** removes the saved context but deliberately leaves partial files on disk.
+Jobs run one at a time. This makes progress easier to understand and reduces concurrent pressure on YouTube. The displayed speed is the average observed transfer rate (bytes transferred divided by elapsed transfer time). Completed history remains in memory, while unfinished jobs have persistent recovery records and return as paused Queue entries after a restart. Failed and paused jobs can also be resumed manually. **Forget recovery record** removes the saved context but deliberately leaves partial files on disk.
 
 ## Configuration
 
@@ -238,7 +240,7 @@ node --check userscript/yt-dlp-for-violentmonkey.user.js
 node tests/userscript_contract.mjs
 ```
 
-The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, in-player button placement, multilingual audio labels and original-track preference, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, shortcut isolation, fullscreen handling, all three download modes, final-only merging, progress parsing, queue completion/failure/cancellation, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
+The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, in-player button placement, homepage launcher behavior, multilingual audio labels and original-track preference, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, persistent Queue-log state, shortcut isolation, fullscreen handling, disabled UI states, reduced-motion-aware transitions, all three download modes, final-only merging, average-speed calculation, queue completion/failure/pausing, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
 
 ## Responsible use
 
