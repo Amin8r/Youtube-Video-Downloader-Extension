@@ -36,7 +36,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 APP_NAME = "yt-dlp for Violentmonkey Bridge"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.3"
 API_VERSION = 1
 DEFAULT_PORT = 17442
 MAX_BODY_BYTES = 64 * 1024
@@ -46,6 +46,10 @@ MAX_INFO_BYTES = 24 * 1024 * 1024
 MAX_RECOVERY_BYTES = 128 * 1024
 INFO_TIMEOUT_SECONDS = 150
 MAX_JOB_RETRIES = 5
+IDLE_CONNECTION_TIMEOUT = 30.0
+INSTANCE_LOCK_NAME = ".vm-yt-dlp.lock"
+MAX_EXPECTED_STREAMS = 8
+MAX_EXPECTED_BYTES = 1024 ** 4  # 1 TiB per stream is far past anything real.
 JOB_RETRY_BASE_SECONDS = 3.0
 JOB_RETRY_MAX_SECONDS = 30.0
 
@@ -56,6 +60,12 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE_STATUSES = frozenset({"interrupted", "failed", "cancelled"})
 RECOVERY_SCHEMA_VERSION = 1
 RECOVERY_DIRNAME = ".vm-yt-dlp-resume"
+# Recovery records are kept only while a resume is still plausible. Without an
+# age limit they accumulate forever, are re-imported as "interrupted" jobs on
+# every launch, and eventually fill MAX_JOBS so that no new download can be
+# queued at all.
+RECOVERY_MAX_AGE_DAYS = 30
+RECOVERY_SOFT_LIMIT = MAX_JOBS // 2
 VIDEO_HOSTS = frozenset(
     {
         "youtube.com",
@@ -70,7 +80,9 @@ COOKIE_BROWSERS = frozenset(
     {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale"}
 )
 COOKIE_KEYRINGS = frozenset({"basictext", "gnomekeyring", "kwallet", "kwallet5", "kwallet6"})
-PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks4a", "socks5"})
+# socks5h (and socks4a) resolve DNS at the proxy, which is what SSH tunnels and
+# Tor need; yt-dlp accepts it, so rejecting it only broke working setups.
+PROXY_SCHEMES = frozenset({"http", "https", "socks4", "socks4a", "socks5", "socks5h"})
 CONTAINERS = frozenset({"auto", "mp4", "mkv", "webm"})
 AUDIO_CODECS = frozenset({"mp3", "m4a", "opus", "flac", "wav"})
 AUDIO_QUALITIES = frozenset({"0", "320K", "256K", "192K", "160K", "128K", "96K"})
@@ -106,9 +118,22 @@ def default_download_dir() -> pathlib.Path:
 
 
 def clean_text(value: Any, limit: int = 500) -> str:
-    text = ANSI_RE.sub("", str(value or "")).replace("\x00", "")
-    text = text.replace("\r", " ").strip()
-    return text[:limit]
+    text = ANSI_RE.sub("", str(value or ""))
+    # Fold C0/C1 controls (including NUL and stray newlines) to spaces so a single
+    # value cannot smuggle extra lines into logs or job fields -- and so that the
+    # words on either side of a removed break do not run together.
+    text = "".join(
+        " " if (ch < " " or "\x7f" <= ch <= "\x9f") else ch
+        for ch in text
+        if ch != "\x00"
+    )
+    return text.strip()[:limit]
+
+
+def clean_block(value: Any, limit: int = 500) -> str:
+    """clean_text for multi-line text: sanitize each line, keep the line breaks."""
+    lines = [clean_text(line, limit) for line in str(value or "").splitlines()]
+    return "\n".join(line for line in lines if line)[:limit]
 
 
 def optional_number(value: Any) -> int | float | None:
@@ -302,8 +327,36 @@ def validate_proxy_url(raw: Any) -> str | None:
 
 
 def redact_proxy_reference(value: Any, proxy_url: str | None) -> str:
+    """Strip the configured proxy from a log line.
+
+    A plain replace only catches the URL spelled exactly as configured. yt-dlp,
+    urllib and the SOCKS layers also print it lowercased, uppercased, without the
+    scheme, with a trailing slash, or as the bare credentials -- so the password
+    survived into job logs, which are handed back to the page by /api/v1/jobs.
+    Redact the whole URL case-insensitively, then the credentials on their own.
+    """
     text = str(value or "")
-    return text.replace(proxy_url, "[configured proxy]") if proxy_url else text
+    if not proxy_url:
+        return text
+    try:
+        parsed = urllib.parse.urlsplit(proxy_url)
+    except ValueError:
+        parsed = None
+
+    needles = {proxy_url, proxy_url.rstrip("/")}
+    if parsed is not None and parsed.netloc:
+        needles.add(parsed.netloc)
+        if parsed.username:
+            credentials = parsed.username
+            if parsed.password:
+                credentials += f":{parsed.password}"
+            needles.add(credentials)
+            needles.add(f"{credentials}@")
+    for needle in sorted((n for n in needles if n), key=len, reverse=True):
+        text = re.sub(re.escape(needle), "[configured proxy]", text, flags=re.IGNORECASE)
+    if parsed is not None and parsed.password:
+        text = re.sub(re.escape(parsed.password), "[redacted]", text, flags=re.IGNORECASE)
+    return text
 
 
 def validate_local_text(value: Any, *, field: str, limit: int = 512) -> str:
@@ -359,6 +412,49 @@ def validate_bool(raw: Mapping[str, Any], key: str, default: bool = False) -> bo
     if not isinstance(value, bool):
         raise BridgeError(f"{key} must be true or false.", code="invalid_options")
     return value
+
+
+def expected_stream_count(download_mode: str, selection: Mapping[str, Any]) -> int:
+    """How many separate media files yt-dlp will download for this job.
+
+    yt-dlp restarts its byte counter for each one, which is why a single job can
+    report 0->100% more than once.
+    """
+    if selection.get("type") == "streams":
+        return 2
+    if selection.get("type") == "exact":
+        # Video-only exact formats in Merge mode get "+bestaudio" appended.
+        if download_mode == "merge" and not selection.get("has_audio"):
+            return 2
+        return 1
+    if download_mode == "merge":
+        return 2
+    return 1
+
+
+def validate_expected_bytes(raw: Any, download_mode: str, selection: Mapping[str, Any]) -> list[float] | None:
+    """Per-stream sizes supplied by the panel so progress can be weighted.
+
+    Optional: the panel only knows these when yt-dlp reported a filesize for each
+    selected format. An entry count that does not match the streams this job will
+    actually download is ignored rather than rejected, so an older or newer panel
+    simply falls back to equal weighting.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not (1 <= len(raw) <= MAX_EXPECTED_STREAMS):
+        raise BridgeError("expected_bytes must be a list of one to eight sizes.", code="invalid_options")
+    sizes: list[float] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise BridgeError("expected_bytes entries must be numbers.", code="invalid_options")
+        value = float(item)
+        if not (0 < value <= MAX_EXPECTED_BYTES):
+            raise BridgeError("expected_bytes entries must be positive and realistic.", code="invalid_options")
+        sizes.append(value)
+    if len(sizes) != expected_stream_count(download_mode, selection):
+        return None
+    return sizes
 
 
 def validate_job_payload(raw: Any) -> dict[str, Any]:
@@ -469,6 +565,8 @@ def validate_job_payload(raw: Any) -> dict[str, Any]:
     if thumbnail_format not in THUMBNAIL_FORMATS:
         raise BridgeError("Unsupported thumbnail format.", code="invalid_options")
 
+    expected_bytes = validate_expected_bytes(raw.get("expected_bytes"), download_mode, selection)
+
     title_hint = clean_text(raw.get("title_hint", "YouTube video"), 240) or "YouTube video"
     thumbnail_hint = str(raw.get("thumbnail_hint", ""))[:2048]
     if thumbnail_hint and not thumbnail_hint.startswith(("https://i.ytimg.com/", "https://img.youtube.com/")):
@@ -483,6 +581,7 @@ def validate_job_payload(raw: Any) -> dict[str, Any]:
         "audio_codec": audio_codec,
         "audio_quality": audio_quality,
         "retry_count": retry_count,
+        "expected_bytes": expected_bytes,
         "cookies": validate_cookie_options(raw.get("cookies")),
         "proxy_url": validate_proxy_url(raw.get("proxy_url")),
         "allow_invalid_certificates": validate_bool(raw, "allow_invalid_certificates"),
@@ -698,35 +797,11 @@ class YtDlpRunner:
                 "--",
                 canonical_url,
             ]
-            try:
-                result = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=INFO_TIMEOUT_SECONDS,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise BridgeError(
-                    "yt-dlp took too long to read this video's formats.",
-                    code="metadata_timeout",
-                    status=HTTPStatus.GATEWAY_TIMEOUT,
-                ) from exc
-            except OSError as exc:
-                raise BridgeError(
-                    "yt-dlp could not be started. Run the bridge doctor command.",
-                    code="ytdlp_unavailable",
-                    status=HTTPStatus.SERVICE_UNAVAILABLE,
-                    details={"reason": clean_text(exc, 300)},
-                ) from exc
+            return_code, stdout_text, stderr_text = self._run_metadata_process(command)
 
-            if len(result.stdout.encode("utf-8", errors="replace")) > MAX_INFO_BYTES:
-                raise BridgeError("yt-dlp returned an unexpectedly large metadata response.", code="metadata_too_large", status=502)
-            if result.returncode != 0:
-                reason = clean_text(
-                    redact_proxy_reference("\n".join((result.stderr or result.stdout).splitlines()[-12:]), validated_proxy),
+            if return_code != 0:
+                reason = clean_block(
+                    redact_proxy_reference("\n".join((stderr_text or stdout_text).splitlines()[-12:]), validated_proxy),
                     1800,
                 )
                 raise BridgeError(
@@ -736,7 +811,7 @@ class YtDlpRunner:
                     details={"reason": reason or "Unknown yt-dlp error"},
                 )
             try:
-                raw = json.loads(result.stdout)
+                raw = json.loads(stdout_text)
             except json.JSONDecodeError as exc:
                 raise BridgeError(
                     "yt-dlp returned invalid metadata.",
@@ -748,6 +823,126 @@ class YtDlpRunner:
             return sanitize_info(raw)
         finally:
             self._info_slots.release()
+
+    @staticmethod
+    def _run_metadata_process(command: Sequence[str]) -> tuple[int, str, str]:
+        """Run yt-dlp and read its JSON incrementally.
+
+        subprocess.run() buffers the whole response before anything can check its
+        size, so MAX_INFO_BYTES did not actually bound memory. Read in chunks and
+        abort the moment the cap is passed.
+        """
+        popen_kwargs: dict[str, Any] = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except OSError as exc:
+            raise BridgeError(
+                "yt-dlp could not be started. Run the bridge doctor command.",
+                code="ytdlp_unavailable",
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                details={"reason": clean_text(exc, 300)},
+            ) from exc
+
+        stderr_tail: collections.deque[str] = collections.deque(maxlen=40)
+
+        def drain_stderr() -> None:
+            try:
+                assert process.stderr is not None
+                for line in process.stderr:
+                    stderr_tail.append(line.rstrip("\n"))
+            except (OSError, ValueError):
+                pass
+
+        reader = threading.Thread(target=drain_stderr, name="vm-ytdlp-info-stderr", daemon=True)
+        reader.start()
+
+        # A silent yt-dlp leaves read() blocked forever, so the deadline cannot be
+        # enforced by checking the clock between reads: kill the process from a
+        # watchdog instead and let the pipe close the loop.
+        expired = threading.Event()
+
+        def on_deadline() -> None:
+            expired.set()
+            YtDlpRunner._terminate_metadata_process(process)
+
+        watchdog = threading.Timer(INFO_TIMEOUT_SECONDS, on_deadline)
+        watchdog.daemon = True
+        watchdog.start()
+
+        chunks: list[str] = []
+        size = 0
+        overflow = False
+        try:
+            assert process.stdout is not None
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk.encode("utf-8", errors="replace"))
+                if size > MAX_INFO_BYTES:
+                    overflow = True
+                    break
+                chunks.append(chunk)
+        finally:
+            watchdog.cancel()
+            if overflow:
+                YtDlpRunner._terminate_metadata_process(process)
+            try:
+                if process.stdout is not None:
+                    process.stdout.close()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                YtDlpRunner._terminate_metadata_process(process)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            reader.join(timeout=2)
+            try:
+                if process.stderr is not None:
+                    process.stderr.close()
+            except OSError:
+                pass
+
+        timed_out = expired.is_set()
+        if overflow:
+            raise BridgeError(
+                "yt-dlp returned an unexpectedly large metadata response.",
+                code="metadata_too_large",
+                status=HTTPStatus.BAD_GATEWAY,
+            )
+        if timed_out:
+            raise BridgeError(
+                "yt-dlp took too long to read this video's formats.",
+                code="metadata_timeout",
+                status=HTTPStatus.GATEWAY_TIMEOUT,
+            )
+        return int(process.returncode or 0), "".join(chunks), "\n".join(stderr_tail)
+
+    @staticmethod
+    def _terminate_metadata_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
 
     def build_download_command(self, options: Mapping[str, Any]) -> list[str]:
         download_dir = self.config.download_dir.expanduser().resolve()
@@ -847,8 +1042,12 @@ class YtDlpRunner:
             if extras["embed_subtitles"] and download_mode != "audio":
                 command.append("--embed-subs")
 
-        if extras["write_thumbnail"] or extras["embed_thumbnail"]:
+        # --embed-thumbnail fetches the image by itself and cleans it up afterwards.
+        # Adding --write-thumbnail as well makes yt-dlp keep the sidecar file, so
+        # only ask for it when the user actually wants the file kept.
+        if extras["write_thumbnail"]:
             command.append("--write-thumbnail")
+        if extras["write_thumbnail"] or extras["embed_thumbnail"]:
             if extras["thumbnail_format"] != "original":
                 command.extend(["--convert-thumbnails", extras["thumbnail_format"]])
         if extras["embed_thumbnail"]:
@@ -1000,6 +1199,8 @@ class JobManager:
             job["_speed_started_monotonic"] = None
             job["_speed_last_downloaded_bytes"] = None
             job["_speed_accumulated_bytes"] = 0.0
+            job["_stream_index"] = 0
+            job["_stream_last_downloaded"] = None
             job["logs"].append("[bridge] Resume requested; yt-dlp will continue compatible partial files.")
             try:
                 self._save_recovery_manifest(job)
@@ -1029,11 +1230,20 @@ class JobManager:
             self._revision += 1
             return True
 
-    def clear_finished(self) -> int:
+    def clear_finished(self, *, include_unfinished: bool = False) -> int:
+        """Drop finished jobs. With include_unfinished, also drop failed, paused
+        and rediscovered entries together with their recovery records, which is
+        the only practical way out of a queue filled with stale records."""
+        removable_statuses = {"completed"}
+        if include_unfinished:
+            removable_statuses |= {"failed", "cancelled", "interrupted"}
         with self._lock:
-            removable = [job_id for job_id, job in self._jobs.items() if job["status"] == "completed"]
+            removable = [
+                job_id for job_id, job in self._jobs.items() if job["status"] in removable_statuses
+            ]
             for job_id in removable:
                 self._jobs.pop(job_id, None)
+                self._delete_recovery_manifest(job_id)
             if removable:
                 self._revision += 1
             return len(removable)
@@ -1086,6 +1296,10 @@ class JobManager:
             "_speed_started_monotonic": None,
             "_speed_last_downloaded_bytes": None,
             "_speed_accumulated_bytes": 0.0,
+            "_stream_count": expected_stream_count(options["download_mode"], options["selection"]),
+            "_stream_weights": list(options.get("expected_bytes") or []) or None,
+            "_stream_index": 0,
+            "_stream_last_downloaded": None,
             "options": dict(options),
         }
 
@@ -1147,15 +1361,47 @@ class JobManager:
         except OSError as exc:
             sys.stderr.write(f"[bridge] Could not remove recovery record {job_id}: {clean_text(exc, 240)}\n")
 
+    def _expire_recovery_manifests(self, paths: Sequence[pathlib.Path]) -> list[pathlib.Path]:
+        """Delete records that are too old or too numerous to still be useful.
+
+        Records are ordered oldest first. Anything past RECOVERY_MAX_AGE_DAYS, or
+        beyond RECOVERY_SOFT_LIMIT of the newest, is removed from disk so the
+        folder cannot grow without bound and fill the job table on every launch.
+        """
+        cutoff = time.time() - RECOVERY_MAX_AGE_DAYS * 86400
+        keep: list[pathlib.Path] = []
+        for path in paths:
+            try:
+                too_old = path.stat().st_mtime < cutoff
+            except OSError:
+                continue
+            if too_old:
+                try:
+                    path.unlink()
+                    sys.stderr.write(f"[bridge] Removed expired recovery record {path.name}.\n")
+                except OSError:
+                    pass
+                continue
+            keep.append(path)
+        surplus, keep = keep[:-RECOVERY_SOFT_LIMIT], keep[-RECOVERY_SOFT_LIMIT:]
+        for path in surplus:
+            try:
+                path.unlink()
+                sys.stderr.write(f"[bridge] Removed surplus recovery record {path.name}.\n")
+            except OSError:
+                pass
+        return keep
+
     def _load_recovery_manifests(self) -> None:
         try:
             candidates = sorted(
                 self._recovery_dir.glob("*.json"),
                 key=lambda path: path.stat().st_mtime,
-            )[-MAX_JOBS:]
+            )
         except OSError as exc:
             sys.stderr.write(f"[bridge] Could not scan recovery records: {clean_text(exc, 240)}\n")
             return
+        candidates = self._expire_recovery_manifests(candidates)
         for path in candidates:
             try:
                 if not re.fullmatch(r"[a-f0-9]{32}\.json", path.name) or path.stat().st_size > MAX_RECOVERY_BYTES:
@@ -1233,6 +1479,8 @@ class JobManager:
                     job["_speed_started_monotonic"] = None
                     job["_speed_last_downloaded_bytes"] = None
                     job["_speed_accumulated_bytes"] = 0.0
+                    job["_stream_index"] = 0
+                    job["_stream_last_downloaded"] = None
                     self._touch(job)
 
                 return_code, start_error = self._run_process_attempt(job_id, options, command)
@@ -1255,7 +1503,7 @@ class JobManager:
                     elif not job["error"]:
                         meaningful = [line for line in job["logs"] if line and not line.startswith("[download]")]
                         job["error"] = (
-                            clean_text("\n".join(meaningful[-8:]), 1800)
+                            clean_block("\n".join(meaningful[-8:]), 1800)
                             or f"yt-dlp exited with code {return_code}."
                         )
 
@@ -1376,6 +1624,19 @@ class JobManager:
                 return True
             time.sleep(min(0.2, remaining))
 
+    @staticmethod
+    def _weighted_percent(job: Mapping[str, Any], stream_fraction: float) -> float:
+        """Map progress within the current stream onto the whole job's bar."""
+        weights = job.get("_stream_weights")
+        count = max(1, int(job.get("_stream_count") or 1))
+        if not weights or len(weights) != count:
+            weights = [1.0] * count
+        total_weight = float(sum(weights)) or 1.0
+        index = min(max(0, int(job.get("_stream_index") or 0)), count - 1)
+        banked = float(sum(weights[:index]))
+        percent = (banked + stream_fraction * float(weights[index])) / total_weight * 100.0
+        return min(100.0, max(0.0, percent))
+
     def _consume_progress(self, job: dict[str, Any], payload: str) -> None:
         values = payload.split("|")
         values.extend(["NA"] * (7 - len(values)))
@@ -1389,11 +1650,27 @@ class JobManager:
         eta = number(4)
         fragment_index = number(5)
         fragment_count = number(6)
-        percent = 0.0
+
+        # yt-dlp restarts downloaded_bytes for each media file, so a merge job used
+        # to fill the bar once per stream. Detect that restart, then spread the bar
+        # across the streams this job will download, weighted by their real sizes
+        # when the panel supplied them.
+        if downloaded is not None:
+            previous = job.get("_stream_last_downloaded")
+            if previous is not None and float(downloaded) < float(previous) - 1:
+                job["_stream_index"] = min(
+                    int(job.get("_stream_index") or 0) + 1,
+                    max(0, int(job.get("_stream_count") or 1) - 1),
+                )
+            job["_stream_last_downloaded"] = float(downloaded)
+
+        stream_fraction = 0.0
         if downloaded is not None and total:
-            percent = min(100.0, max(0.0, float(downloaded) / float(total) * 100))
+            stream_fraction = float(downloaded) / float(total)
         elif fragment_index is not None and fragment_count:
-            percent = min(100.0, max(0.0, float(fragment_index) / float(fragment_count) * 100))
+            stream_fraction = float(fragment_index) / float(fragment_count)
+        stream_fraction = min(1.0, max(0.0, stream_fraction))
+        percent = self._weighted_percent(job, stream_fraction)
         progress = job["progress"]
         average_speed: float | None = None
         elapsed_seconds: float | None = None
@@ -1434,7 +1711,8 @@ class JobManager:
         self._touch(job)
 
     def _append_log(self, job: dict[str, Any], line: str) -> None:
-        for part in clean_text(line, 4000).splitlines():
+        for raw_part in str(line or "").splitlines():
+            part = clean_text(raw_part, 4000)
             if part:
                 job["logs"].append(part)
         if len(job["logs"]) > MAX_LOG_LINES:
@@ -1467,13 +1745,19 @@ class JobManager:
     def _prune_if_needed(self) -> None:
         if len(self._jobs) < MAX_JOBS:
             return
-        for job_id, job in list(self._jobs.items()):
-            if job["status"] == "completed":
-                self._jobs.pop(job_id, None)
-                if len(self._jobs) < MAX_JOBS:
-                    return
+        # Oldest first, cheapest to discard first: finished jobs hold nothing the
+        # user can act on, then rediscovered records, then jobs that already ran
+        # out of attempts or were paused long ago.
+        for statuses in (("completed",), ("interrupted",), ("cancelled", "failed")):
+            for job_id, job in list(self._jobs.items()):
+                if job["status"] in statuses:
+                    self._jobs.pop(job_id, None)
+                    self._delete_recovery_manifest(job_id)
+                    if len(self._jobs) < MAX_JOBS:
+                        return
         raise BridgeError(
-            "The queue is full. Clear completed jobs or forget an unfinished download before adding another.",
+            "The queue is full because too many downloads are still active. "
+            "Wait for one to finish, or pause and forget one before adding another.",
             code="queue_full",
             status=409,
         )
@@ -1504,9 +1788,86 @@ class JobManager:
         threading.Thread(target=force_kill, name="vm-ytdlp-killer", daemon=True).start()
 
 
+class InstanceLock:
+    """Exclusive advisory lock over one download folder.
+
+    Two bridges pointed at the same download_dir each rediscover the other's
+    in-flight job as an "interrupted" record and offer to resume it, which would
+    run a second yt-dlp against the same output file. The port bind only prevents
+    a collision when both use the same port, so the folder needs its own lock.
+    """
+
+    def __init__(self, path: pathlib.Path) -> None:
+        self.path = path
+        self._handle: Any = None
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path, "a+", encoding="utf-8")  # noqa: SIM115 - held for process lifetime
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ImportError) as exc:
+            handle.close()
+            if isinstance(exc, ImportError):
+                # No locking primitive available: carry on rather than refuse to start.
+                sys.stderr.write("[bridge] Instance locking is unavailable on this platform.\n")
+                return
+            raise BridgeError(
+                f"Another bridge is already using {self.path.parent}. "
+                "Stop it before starting a second one, or give this instance its own download folder.",
+                code="instance_locked",
+                status=HTTPStatus.CONFLICT,
+            ) from exc
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        self._handle = handle
+
+    def release(self) -> None:
+        handle, self._handle = self._handle, None
+        if handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, ImportError):
+            pass
+        finally:
+            handle.close()
+
+    def __enter__(self) -> "InstanceLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.release()
+
+
 def origin_allowed(origin: str | None) -> bool:
-    if not origin or origin == "null":
+    # An absent Origin is allowed because GM_xmlhttpRequest does not always send
+    # one. A literal "null" origin is not: it identifies a sandboxed frame or a
+    # data:/file: document, which is exactly the caller this check exists to keep
+    # out, and it was previously echoed back in Access-Control-Allow-Origin.
+    if not origin:
         return True
+    if origin == "null":
+        return False
     try:
         parsed = urllib.parse.urlsplit(origin)
     except ValueError:
@@ -1516,7 +1877,11 @@ def origin_allowed(origin: str | None) -> bool:
 
 class BridgeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR lets a second process bind a port that is already
+    # in use and steal part of the traffic, so the token-protected API would be
+    # split between two bridges (or an impostor). Only enable it on POSIX, where
+    # it merely skips the TIME_WAIT delay.
+    allow_reuse_address = os.name != "nt"
 
     def __init__(self, address: tuple[str, int], config: BridgeConfig, runner: YtDlpRunner, jobs: JobManager) -> None:
         self.config = config
@@ -1530,13 +1895,54 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "VMYtDlpBridge"
     sys_version = ""
+    # Close idle keep-alive connections instead of pinning a thread forever. The
+    # panel polls at most every 9 seconds, so a live tab always reuses its socket.
+    timeout = IDLE_CONNECTION_TIMEOUT
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[{self.log_date_time_string()}] {self.client_address[0]} {fmt % args}\n")
 
+    def log_error(self, fmt: str, *args: Any) -> None:
+        # An idle keep-alive connection timing out is routine, not an error.
+        if "timed out" in (fmt % args if args else fmt).lower():
+            return
+        self.log_message(fmt, *args)
+
+    def _drain_body(self) -> None:
+        """Discard an unread request body so the connection stays in sync.
+
+        Without this, enabling keep-alive would let the body of a request that was
+        rejected before it was read (bad token, bad Host, wrong Content-Type) be
+        parsed as the start of the next request on the same connection.
+        """
+        if getattr(self, "_body_consumed", False):
+            return
+        self._body_consumed = True
+        if self.headers.get("Transfer-Encoding", "").strip():
+            self.close_connection = True
+            return
+        try:
+            remaining = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            return
+        if remaining <= 0:
+            return
+        if remaining > MAX_BODY_BYTES:
+            # Too big to be worth reading just to stay in sync.
+            self.close_connection = True
+            return
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         if not self._request_envelope_valid(require_origin=True):
             return
+        self._drain_body()
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_common_headers(content_length=0)
         self.end_headers()
@@ -1612,7 +2018,9 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 self._json_response(HTTPStatus.CREATED, {"job": self.server.jobs.enqueue(body)})
                 return
             if path == "/api/v1/jobs/clear":
-                self._json_response(HTTPStatus.OK, {"cleared": self.server.jobs.clear_finished()})
+                include_unfinished = isinstance(body, dict) and body.get("include_unfinished") is True
+                cleared = self.server.jobs.clear_finished(include_unfinished=include_unfinished)
+                self._json_response(HTTPStatus.OK, {"cleared": cleared})
                 return
             match = re.fullmatch(r"/api/v1/jobs/([a-f0-9]{32})/cancel", path)
             if match:
@@ -1658,19 +2066,43 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             raise BridgeError("Content-Type must be application/json.", code="invalid_content_type", status=415)
+        # A chunked body has no Content-Length, so the old code silently read zero
+        # bytes and validated an empty object instead of the request that was sent.
+        if self.headers.get("Transfer-Encoding", "").strip().lower():
+            raise BridgeError(
+                "Chunked request bodies are not supported; send Content-Length.",
+                code="length_required",
+                status=HTTPStatus.LENGTH_REQUIRED,
+            )
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise BridgeError(
+                "Content-Length is required.", code="length_required", status=HTTPStatus.LENGTH_REQUIRED
+            )
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = int(raw_length)
         except ValueError as exc:
             raise BridgeError("Invalid Content-Length.", code="invalid_body") from exc
         if length < 0 or length > MAX_BODY_BYTES:
             raise BridgeError("Request body is too large.", code="body_too_large", status=413)
+        # Claim the body before reading: a partial read must not be retried by the
+        # drain in the error path.
+        self._body_consumed = True
         payload = self.rfile.read(length)
+        if len(payload) != length:
+            self.close_connection = True
+            raise BridgeError("Request body was shorter than Content-Length.", code="invalid_body")
         try:
             return json.loads(payload.decode("utf-8")) if payload else {}
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise BridgeError("Request body is not valid JSON.", code="invalid_json") from exc
 
     def _json_response(self, status: int, payload: Mapping[str, Any], *, authenticated: bool = True) -> None:
+        # Covers success paths that never read a body, such as GET with one attached.
+        try:
+            self._drain_body()
+        except OSError:
+            self.close_connection = True
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(int(status))
         self._send_common_headers(content_length=len(body), authenticated=authenticated)
@@ -1679,6 +2111,11 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _error_response(self, exc: BridgeError) -> None:
+        # Rejections happen before the body is read, so drain it first.
+        try:
+            self._drain_body()
+        except OSError:
+            self.close_connection = True
         payload: dict[str, Any] = {"error": {"code": exc.code, "message": exc.message}}
         if exc.details:
             payload["error"]["details"] = exc.details
@@ -1701,7 +2138,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Length", str(content_length))
-        self.send_header("Connection", "close")
+        # Every response carries an accurate Content-Length and every unread body
+        # is drained, so the connection can safely be reused. Honour the client's
+        # wishes and any decision made while handling this request.
+        self.send_header("Connection", "close" if self.close_connection else "keep-alive")
 
 
 def emit_userscript(template: pathlib.Path, output: pathlib.Path, config: BridgeConfig) -> pathlib.Path:
@@ -1715,7 +2155,19 @@ def emit_userscript(template: pathlib.Path, output: pathlib.Path, config: Bridge
         "__VM_YTDLP_API_BASE__", f"http://127.0.0.1:{config.port}"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(configured, encoding="utf-8")
+    # Create the file owner-only *before* the token is written. Writing first and
+    # chmod-ing afterwards left the pairing token world-readable in between.
+    temporary = output.with_name(f".{output.name}.{secrets.token_hex(4)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(configured)
+        os.replace(temporary, output)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
     try:
         os.chmod(output, 0o600)
     except OSError:
@@ -1741,10 +2193,31 @@ def run_doctor(config: BridgeConfig) -> int:
 
 
 def serve(config: BridgeConfig) -> int:
-    config.download_dir.expanduser().mkdir(parents=True, exist_ok=True)
+    download_dir = config.download_dir.expanduser()
+    download_dir.mkdir(parents=True, exist_ok=True)
+    instance_lock = InstanceLock(download_dir / INSTANCE_LOCK_NAME)
+    instance_lock.acquire()
+    try:
+        return _serve_locked(config)
+    finally:
+        instance_lock.release()
+
+
+def _serve_locked(config: BridgeConfig) -> int:
     runner = YtDlpRunner(config)
     jobs = JobManager(runner)
-    server = BridgeHTTPServer(("127.0.0.1", config.port), config, runner, jobs)
+    try:
+        server = BridgeHTTPServer(("127.0.0.1", config.port), config, runner, jobs)
+    except OSError as exc:
+        # Previously this escaped main()'s BridgeError handler as a raw traceback,
+        # which under systemd's Restart=on-failure became a silent restart loop.
+        jobs.stop()
+        raise BridgeError(
+            f"Could not listen on 127.0.0.1:{config.port}: {clean_text(exc, 200)}. "
+            "Another bridge may already be running, or the port is taken.",
+            code="port_unavailable",
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+        ) from exc
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: Any) -> None:

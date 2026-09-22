@@ -15,7 +15,7 @@ An unofficial YouTube-only Violentmonkey userscript backed by the real `yt-dlp` 
 - Persistent recovery records that rediscover interrupted jobs after the companion or computer restarts
 - Final-only merging: successful video/audio inputs are removed after ffmpeg creates the combined media file
 - Optional authenticated extraction through yt-dlp's local `--cookies-from-browser` support
-- Per-userscript HTTP, HTTPS, SOCKS4, SOCKS4A, or SOCKS5 proxy support for metadata and downloads
+- Per-userscript HTTP, HTTPS, SOCKS4, SOCKS4A, SOCKS5, or SOCKS5H proxy support for metadata and downloads
 - Optional self-signed/invalid TLS certificate support, disabled by default with an in-panel security warning
 - YouTube SPA, Shorts, live-video, mobile YouTube, and YouTube Music watch-page support
 - Compact white YouTube-style download button with a red hover glow, mounted directly in the player's right-side controls between its settings and theater/fullscreen groups
@@ -115,8 +115,9 @@ Supported examples:
 - `https://proxy.example:8443`
 - `socks5://127.0.0.1:1080`
 - `socks5://user:password@127.0.0.1:1080`
+- `socks5h://127.0.0.1:9050` (DNS resolved at the proxy, as Tor and SSH tunnels expect)
 
-The bridge validates the URL and passes it to yt-dlp's `--proxy` option as one argument. Proxy credentials are kept in Violentmonkey's private script storage, omitted from public queue objects, and redacted if yt-dlp repeats the configured URL in a log. Treat an exported or backed-up userscript data file as sensitive when it contains proxy credentials.
+The bridge validates the URL and passes it to yt-dlp's `--proxy` option as one argument. Proxy credentials are kept in Violentmonkey's private script storage, omitted from public queue objects, and redacted from job logs — including when yt-dlp prints the address in a different case, without its scheme, or as bare credentials. Treat an exported or backed-up userscript data file as sensitive when it contains proxy credentials.
 
 ## Self-signed or invalid TLS certificates
 
@@ -131,6 +132,12 @@ The **Reliability → Automatic job retries** control chooses how many times the
 Each attempt also enables yt-dlp's own HTTP, fragment, file-access, and extractor retries with exponential delays. Compatible partial downloads remain as `.part` files and the next attempt uses the same output name, allowing yt-dlp to continue instead of discarding already downloaded data. Pause stops the active process immediately—even during retry backoff—while retaining its recovery record for Resume.
 
 The companion writes a small recovery record for each queued job under the download folder's hidden `.vm-yt-dlp-resume` directory. If the browser, bridge, or computer stops before completion, the next bridge launch discovers that record and shows the job in the Queue as **Ready to resume**. Resume is always manual: choose **Resume** and yt-dlp runs with `--continue` against the existing `.part` files. A successful job removes its recovery record automatically.
+
+Records for jobs that were never finished are kept for 30 days, and only the 50
+most recent are retained. Anything older or beyond that is deleted at startup so
+the folder cannot grow until the queue refuses new downloads. Deleting a record
+never touches the `.part` files themselves. To clear the backlog by hand, use
+**Forget all unfinished** in the Queue header.
 
 Proxy credentials, browser-cookie choices, and the invalid-certificate setting are deliberately excluded from recovery records. The Resume button applies the settings currently selected in the userscript. Recovery records are created with owner-only permissions where the operating system supports them.
 
@@ -206,13 +213,15 @@ Common causes:
 - yt-dlp is launched with `shell=False` semantics and an argument array.
 - Pausing terminates the complete yt-dlp/ffmpeg process group while retaining compatible partial data for Resume.
 - Recovery manifests are schema-validated before use, use owner-only permissions where supported, and never retain proxy credentials or browser-cookie settings.
+- Only one bridge may use a download folder at a time; a second instance is refused
+  so two copies cannot resume the same job into the same output file.
 - The paired userscript contains the local token. Treat that file as private and do not publish it.
 
 Any local process running as your operating-system user can generally access your files and browser profile already; the bridge token primarily protects the service from arbitrary web pages.
 
 ## Queue behavior
 
-Jobs run one at a time. This makes progress easier to understand and reduces concurrent pressure on YouTube. The displayed speed is the average observed transfer rate (bytes transferred divided by elapsed transfer time). Completed history remains in memory, while unfinished jobs have persistent recovery records and return as paused Queue entries after a restart. Failed and paused jobs can also be resumed manually. **Forget recovery record** removes the saved context but deliberately leaves partial files on disk.
+Jobs run one at a time. This makes progress easier to understand and reduces concurrent pressure on YouTube. The displayed speed is the average observed transfer rate (bytes transferred divided by elapsed transfer time). For Merge jobs the progress bar spans both streams, weighted by their sizes, so it advances once from 0 to 100% rather than filling separately for the video and the audio. Completed history remains in memory, while unfinished jobs have persistent recovery records and return as paused Queue entries after a restart. Failed and paused jobs can also be resumed manually. **Forget recovery record** removes the saved context but deliberately leaves partial files on disk.
 
 ## Configuration
 
@@ -238,7 +247,15 @@ The release includes an offline fake-yt-dlp integration suite:
 python3 -m unittest discover -s tests -v
 node --check userscript/yt-dlp-for-violentmonkey.user.js
 node tests/userscript_contract.mjs
+node tests/userscript_behavior.mjs
 ```
+
+`userscript_contract.mjs` checks that required source text is present.
+`userscript_behavior.mjs` is different: it extracts the real `fetchInfo`,
+`pollJobs`, `enqueueCurrent` and `sortedFormats` bodies and runs them against
+stubs, so logic errors in those async flows are caught rather than assumed
+absent. Point it at another build with
+`VM_YTDLP_USERSCRIPT=/path/to/other.user.js node tests/userscript_behavior.mjs`.
 
 The tests cover URL boundaries, cookie and proxy validation, opt-in certificate bypass, in-player button placement, homepage launcher behavior, multilingual audio labels and original-track preference, command whitelisting, retry limits and backoff, recovery-record permissions and credential omission, restart discovery, resume completion, recovery removal, persistent Queue-log state, shortcut isolation, fullscreen handling, disabled UI states, reduced-motion-aware transitions, all three download modes, final-only merging, average-speed calculation, queue completion/failure/pausing, token enforcement, allowed origins, and HTTP endpoints. They do not download copyrighted media or depend on YouTube being reachable.
 

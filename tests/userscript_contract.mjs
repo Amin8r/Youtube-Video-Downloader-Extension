@@ -20,7 +20,7 @@ const requiredFragments = [
   '// @grant        GM_setValue',
   '// @grant        GM_addElement',
   '// @inject-into  content',
-  '// @version      1.7.1',
+  '// @version      1.7.3',
   "attachShadow({ mode: 'closed' })",
   "document.implementation.createHTMLDocument('yt-dlp UI')",
   'replaceMarkup(shadow, `',

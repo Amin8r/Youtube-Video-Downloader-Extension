@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         yt-dlp for Violentmonkey
 // @namespace    local.vm-yt-dlp
-// @version      1.7.1
+// @version      1.7.3
 // @description  A secure, native-feeling YouTube download panel powered by your local yt-dlp.
 // @license      MIT
 // @match        https://www.youtube.com/*
@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.7.1';
+  const VERSION = '1.7.3';
   const BOOTSTRAP_TOKEN = '__VM_YTDLP_TOKEN__';
   const BOOTSTRAP_API_BASE = '__VM_YTDLP_API_BASE__';
   const STORAGE_KEY = 'vmYtDlp.settings.v1';
@@ -105,6 +105,7 @@
     health: null,
     info: null,
     infoUrl: '',
+    infoRequestUrl: '',
     infoLoading: false,
     infoError: null,
     jobs: [],
@@ -1131,37 +1132,47 @@
       return;
     }
     if (!force && state.info && state.infoUrl === url) return;
-    if (state.infoLoading) return;
+    // Reading formats can take a minute. If the user navigates during that time,
+    // the in-flight request is for the previous video: mark it stale so its
+    // response is discarded, and start a fresh request for the page we are on.
+    // Without this, the panel kept showing the old video and queued it instead.
+    if (state.infoLoading && state.infoRequestUrl === url) return;
     const previousInfoUrl = state.infoUrl;
+    const requestUrl = url;
+    state.infoRequestUrl = requestUrl;
     state.infoLoading = true;
     state.infoError = null;
     if (state.tab === 'download') renderDownload();
     try {
       await requireNetworkCapabilities();
       const response = await apiRequest('POST', '/api/v1/info', {
-        url,
+        url: requestUrl,
         cookies: cookiePayload(),
         proxy_url: proxyPayload(),
         allow_invalid_certificates: state.settings.allowInvalidCertificates === true,
       });
-      if (previousInfoUrl !== url) {
+      if (state.infoRequestUrl !== requestUrl || currentVideoUrl() !== requestUrl) return;
+      if (previousInfoUrl !== requestUrl) {
         state.form.exactFormatId = '';
         state.form.mergeVideoFormatId = '';
         state.form.mergeAudioFormatId = '';
       }
       state.info = response.info;
-      state.infoUrl = url;
+      state.infoUrl = requestUrl;
       state.connection = 'ready';
       ensureExactFormat();
     } catch (error) {
+      if (state.infoRequestUrl !== requestUrl) return;
       state.info = null;
       state.infoUrl = '';
       state.infoError = error;
       if (error.code === 'connection_failed' || error.status === 401) state.connection = 'offline';
     } finally {
-      state.infoLoading = false;
-      updateChrome();
-      if (state.tab === 'download') renderDownload();
+      if (state.infoRequestUrl === requestUrl) {
+        state.infoLoading = false;
+        updateChrome();
+        if (state.tab === 'download') renderDownload();
+      }
     }
   }
 
@@ -1517,6 +1528,29 @@
     content.querySelector('[data-action="enqueue"]')?.addEventListener('click', enqueueCurrent);
   }
 
+  function formatBytesHint(format) {
+    const size = Number(format?.filesize || format?.filesize_approx);
+    return Number.isFinite(size) && size > 0 ? size : 0;
+  }
+
+  // Sizes of each file yt-dlp will download, in the order it downloads them.
+  // Returns undefined unless every size is known, so the bridge falls back to
+  // equal weighting rather than being handed a guess.
+  function expectedStreamBytes(format, mergeVideoFormat, mergeAudioFormat) {
+    const mode = state.form.downloadMode;
+    let sizes;
+    if (mode === 'merge' && mergeVideoFormat && mergeAudioFormat) {
+      sizes = [formatBytesHint(mergeVideoFormat), formatBytesHint(mergeAudioFormat)];
+    } else if (mode === 'merge' && format && !format.has_audio) {
+      return undefined; // "+bestaudio" is chosen by yt-dlp; its size is unknown here.
+    } else if (format) {
+      sizes = [formatBytesHint(format)];
+    } else {
+      return undefined;
+    }
+    return sizes.every((size) => size > 0) ? sizes : undefined;
+  }
+
   async function enqueueCurrent() {
     const button = content.querySelector('[data-action="enqueue"]');
     const isMergeMode = state.form.downloadMode === 'merge';
@@ -1565,6 +1599,9 @@
       audio_codec: state.form.audioCodec,
       audio_quality: state.form.audioQuality,
       retry_count: retryCount,
+      // Let the bridge weight one progress bar across both streams instead of
+      // filling it once per stream. Omitted when any size is unknown.
+      expected_bytes: expectedStreamBytes(format, mergeVideoFormat, mergeAudioFormat),
       cookies: cookiePayload(),
       proxy_url: proxyPayload(),
       allow_invalid_certificates: state.settings.allowInvalidCertificates === true,
@@ -1714,6 +1751,7 @@
     else if (button.dataset.resumeJob) void resumeJob(button.dataset.resumeJob);
     else if (button.dataset.forgetJob) void forgetJob(button.dataset.forgetJob);
     else if (button.dataset.action === 'clear-jobs') void clearJobs();
+    else if (button.dataset.action === 'clear-all-jobs') void clearJobs(true);
   }
 
   function renderJobStats(view) {
@@ -1834,6 +1872,7 @@
         <div class="vm-queue-head">
           <div class="vm-queue-summary"><strong data-queue-title>${h(queue.title)}</strong><span data-queue-meta>${h(queue.meta)}</span></div>
           <button class="vm-secondary danger" type="button" data-action="clear-jobs">${ICONS.trash} Clear completed</button>
+          ${state.jobs.some((job) => RESUMABLE_STATUSES.has(job.status)) ? `<button class="vm-secondary danger" type="button" data-action="clear-all-jobs" title="Forget every paused, failed and recovered entry; partial files stay on disk">${ICONS.trash} Forget all unfinished</button>` : ''}
         </div>
         <div>${state.jobs.map(renderJob).join('')}</div>
         <div class="vm-footer">Paused and recovered downloads stay resumable until you choose Resume. The queue runs sequentially to reduce YouTube rate-limit pressure.</div>
@@ -1872,6 +1911,14 @@
       state.jobs = response.jobs || [];
       state.revision = response.revision ?? state.revision;
       state.connection = 'ready';
+      // Drop notification keys for jobs the bridge no longer reports, otherwise
+      // this Set grows for the whole lifetime of the tab.
+      if (state.notified.size > 200) {
+        const live = new Set(state.jobs.map((job) => job.id));
+        for (const key of state.notified) {
+          if (!live.has(key.slice(0, key.indexOf(':')))) state.notified.delete(key);
+        }
+      }
       for (const job of state.jobs) {
         const oldStatus = previous.get(job.id);
         if (oldStatus && !TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(job.status) && !state.notified.has(`${job.id}:${job.status}`)) {
@@ -1943,10 +1990,12 @@
     }
   }
 
-  async function clearJobs() {
+  async function clearJobs(includeUnfinished = false) {
+    if (includeUnfinished && !window.confirm('Forget every paused, failed and recovered entry? Partial files stay on disk, but they can no longer be resumed from this panel.')) return;
     try {
-      const response = await apiRequest('POST', '/api/v1/jobs/clear', {});
-      toast(`Cleared ${response.cleared} completed job${response.cleared === 1 ? '' : 's'}.`);
+      const response = await apiRequest('POST', '/api/v1/jobs/clear', { include_unfinished: includeUnfinished === true });
+      const noun = includeUnfinished ? 'job' : 'completed job';
+      toast(`Cleared ${response.cleared} ${noun}${response.cleared === 1 ? '' : 's'}.`);
       await pollJobs(true);
     } catch (error) {
       toast(error.message, true);
@@ -2154,6 +2203,11 @@
         state.info = null;
         state.infoUrl = '';
         state.infoError = null;
+        // Any metadata request still in flight belongs to the page we just left.
+        if (state.infoLoading && state.infoRequestUrl !== nextUrl) {
+          state.infoRequestUrl = nextUrl;
+          state.infoLoading = false;
+        }
         if (state.open && state.tab === 'download') {
           renderDownload();
           fetchInfo(false);
