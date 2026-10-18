@@ -7,7 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Cookies file as a cookie source.** Behind a flagged proxy, YouTube answers
+  `Sign in to confirm you're not a bot`, and browser cookies cannot get past it:
+  the browser keeps using the session from its own IP address while yt-dlp uses
+  it through the proxy, so YouTube signs the copy out. Set `cookies_file` in
+  `config.json` to a cookies.txt exported from a private window, then choose
+  **Cookie source → Cookies file**. The path can only come from the config; the
+  API just selects `"source": "file"`. Each yt-dlp run gets a private copy, and
+  the cookies YouTube refreshed during the run are merged back afterwards, which
+  keeps the session signed in. A cookie two runs both changed keeps the later
+  expiry, so a long download finishing last cannot undo a newer refresh. A file
+  replaced with a fresh export mid-run is left alone. Deletions and saves cut
+  off by a cancelled run are not merged. The health endpoint gains the
+  `cookies_file` capability with `cookies_file_configured` and
+  `cookies_file_found`, and `doctor` reports the file.
+
 ### Changed
+
+- **Sign-in errors name the fix.** `Sign in to confirm you're not a bot`, in a
+  job or while loading formats, now carries a note matching the cookie setting:
+  the connection's IP address is flagged when no cookies are used, or the
+  session was rejected when they are.
+- The Settings section is now **Account cookies**, with **Use account cookies**
+  and a **Cookie source** choice. Browser fields appear only for the browser
+  source.
 
 - **Rejected browser cookies are explained instead of repeated.** When YouTube
   signs out the session read through **Use browser cookies**, yt-dlp prints
@@ -15,7 +40,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request, which filled the job log with identical warnings that did not say
   whether the download was affected. The bridge now keeps one copy per attempt
   and adds a `[bridge]` note: the download continues without the account, public
-  videos are unaffected, and what to check if the video needs the account. If the
+  videos are unaffected, and what to do if the video needs the account. If the
   job then fails — typically `Sign in to confirm your age` — the same note is
   appended to the error details.
 

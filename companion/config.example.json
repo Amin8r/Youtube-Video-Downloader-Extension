@@ -2,5 +2,6 @@
   "token": "generated-automatically-by-the-installer",
   "port": 17442,
   "download_dir": "/home/you/Downloads/YouTube",
-  "concurrent_fragments": 4
+  "concurrent_fragments": 4,
+  "cookies_file": "/home/you/.config/vm-yt-dlp/youtube-cookies.txt"
 }

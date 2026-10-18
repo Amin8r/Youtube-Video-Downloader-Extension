@@ -94,15 +94,37 @@ The installer creates a per-user LaunchAgent.
 
 ## Authenticated downloads
 
-Open the panel's **Settings** tab and enable **Use browser cookies**. Pick the browser whose active profile can view the video.
+Open the panel's **Settings** tab and enable **Use account cookies**, then choose a **Cookie source**. Cookies are only needed for videos that require an account, such as age-restricted, private, or members-only videos, or when YouTube answers `Sign in to confirm you're not a bot`.
+
+### Cookies file (recommended, and required in practice behind a proxy)
+
+`Sign in to confirm you're not a bot` usually means YouTube has flagged the IP address, which is common with proxies and VPNs. Browser cookies rarely get past it: the browser keeps using that session from your own IP address while yt-dlp uses it through the proxy, and YouTube signs the second copy out. Give yt-dlp a session of its own instead:
+
+1. Open a new private window. If you download through a proxy, consider pointing that browser at the same proxy first, so the session starts from the address yt-dlp will use.
+2. Sign in to YouTube (a secondary account is safer; see below), then open `https://www.youtube.com/robots.txt` in the same tab.
+3. Export the `youtube.com` cookies in Netscape format with a cookies.txt extension. The [yt-dlp FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp) lists suitable ones. Do not create the file with `yt-dlp --cookies-from-browser`, which exports your regular profile rather than the private session.
+4. Close the private window without signing out, so no browser touches that session again.
+5. Add the file to the companion's config, restart the companion (`systemctl --user restart vm-yt-dlp.service` on Linux), and set **Cookie source** to **Cookies file**:
+
+   ```json
+   "cookies_file": "~/.config/vm-yt-dlp/youtube-cookies.txt"
+   ```
+
+YouTube refreshes session cookies as they are used. yt-dlp saves the refreshed values when it exits, and the companion merges them back into this file, so the session stays signed in across downloads. Each run works on a private copy, so a long download cannot overwrite newer cookies saved by a format lookup in the meantime. Replacing the file with a fresh export takes effect on the next run, and a run that was already going does not overwrite it. Keep the file private: it signs in as your account. If the log reports that the cookies are no longer valid, repeat the export.
+
+yt-dlp warns that using an account with it can get the account [temporarily or permanently banned](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies), so prefer a secondary account and keep the download rate modest.
+
+### Browser profile
+
+Pick the browser whose active profile can view the video.
 
 - Leave **Profile name or path** empty to use the most recently accessed profile.
 - Firefox containers are supported through the optional container field.
 - Linux Chromium browsers may require the correct keyring selection.
 - On some platforms, Chromium locks its cookie database while the browser is running. If extraction fails, close that browser briefly and retry, or use a separate profile.
-- `The provided YouTube account cookies are no longer valid` means YouTube signed out the session yt-dlp read from your browser, and the download continued without your account. Public videos are unaffected. Open YouTube tabs keep rotating the login cookies while yt-dlp reads the copy saved on disk, which can lag behind. If the video needs your account, confirm that the selected browser and profile are signed in to YouTube, close that browser completely so it saves its current cookies, then resume. The companion logs this warning once with an explanation instead of repeating it after every request.
+- `The provided YouTube account cookies are no longer valid` means YouTube signed out the session yt-dlp read from your browser, and the download continued without your account. Public videos are unaffected. Open YouTube tabs keep rotating the login cookies, nothing saves the values yt-dlp receives back into the browser, and a session used through a proxy is often signed out outright. Switch to a cookies file if you need the account. The companion logs this warning once with an explanation instead of repeating it after every request.
 
-Cookie files and cookie values are never sent to the userscript. The companion only asks yt-dlp to read them locally for the requested download.
+Cookie values are never sent to the userscript. The companion only asks yt-dlp to read them locally for the requested download, and only `config.json` can name a cookies file.
 
 ## Proxy setup
 
@@ -233,6 +255,7 @@ Important fields:
 - `port`: local API port, default `17442`
 - `download_dir`: destination folder
 - `concurrent_fragments`: 1–16, default `4`
+- `cookies_file`: optional path to a Netscape cookies.txt for **Cookie source → Cookies file**; the companion keeps it updated
 - `token`: generated pairing secret
 - `ytdlp_command`: optional string or argument array for an advanced custom yt-dlp installation
 

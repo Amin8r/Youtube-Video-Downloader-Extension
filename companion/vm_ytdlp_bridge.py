@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import copy
 import dataclasses
 import datetime as dt
@@ -25,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -32,7 +34,7 @@ import urllib.parse
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 APP_NAME = "yt-dlp for Violentmonkey Bridge"
@@ -55,16 +57,35 @@ JOB_RETRY_MAX_SECONDS = 30.0
 
 PROGRESS_PREFIX = "__VMYTDLP_PROGRESS__"
 OUTPUT_PREFIX = "__VMYTDLP_OUTPUT__"
-# yt-dlp prints this after every request once YouTube has signed the borrowed
-# browser session out, so a single rejection fills the log with identical lines
-# that do not say whether the download is affected.
+# yt-dlp prints this after every request once YouTube has signed the session
+# out, so a single rejection fills the log with identical lines that do not say
+# whether the download is affected.
 COOKIES_REJECTED_MARKER = "provided youtube account cookies are no longer valid"
-COOKIES_REJECTED_HINT = (
-    "YouTube rejected the signed-in cookies yt-dlp read from your browser, so it continued "
-    "without your account. Public videos still download normally. If this video needs your "
-    "account, check the cookie browser and profile in Settings, close that browser completely "
-    "so it saves its current cookies, then resume. Otherwise, turn off Use browser cookies."
+COOKIES_REJECTED_HINTS = {
+    "browser": (
+        "YouTube rejected the signed-in cookies yt-dlp read from your browser, so it continued "
+        "without your account. Public videos still download normally. Browser cookies stop working "
+        "when the browser refreshes them, and when the same session is used through a proxy. For "
+        "videos that need your account, set Cookie source to Cookies file in Settings. Otherwise, "
+        "turn off Use account cookies."
+    ),
+    "file": (
+        "YouTube rejected the session in the companion's cookies file, so yt-dlp continued without "
+        "your account. Public videos still download normally. Export a fresh cookies.txt from a new "
+        "private window, close that window, replace the file, then resume."
+    ),
+}
+# "Sign in to confirm you're not a bot" is YouTube refusing the IP address,
+# which is common behind proxies and VPNs.
+BOT_CHECK_MARKER = "not a bot"
+BOT_CHECK_HINT = (
+    "YouTube wants this connection to sign in, which usually means it has flagged the IP address. "
+    "This is common with proxies and VPNs. Try another proxy or none, or sign in with a cookies "
+    "file: Settings, Account cookies, Cookie source."
 )
+COOKIE_SOURCES = frozenset({"browser", "file"})
+COOKIE_FILE_HEADER = "# Netscape HTTP Cookie File\n# Kept up to date by the yt-dlp for Violentmonkey bridge.\n\n"
+HTTPONLY_PREFIX = "#HttpOnly_"
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE_STATUSES = frozenset({"interrupted", "failed", "cancelled"})
@@ -181,6 +202,9 @@ class BridgeConfig:
     download_dir: pathlib.Path
     ytdlp_command: tuple[str, ...]
     concurrent_fragments: int = 4
+    # Only config.json may name this file: yt-dlp writes to it, so the HTTP API
+    # merely chooses between browser and file cookies.
+    cookies_file: pathlib.Path | None = None
 
     @classmethod
     def load(cls, path: pathlib.Path, *, create: bool = False) -> "BridgeConfig":
@@ -237,12 +261,22 @@ class BridgeConfig:
         if not isinstance(fragments, int) or isinstance(fragments, bool) or not (1 <= fragments <= 16):
             fragments = 4
 
+        cookies_raw = raw.get("cookies_file")
+        if cookies_raw is not None and not isinstance(cookies_raw, str):
+            raise BridgeError(
+                "cookies_file must be a path string.",
+                code="config_invalid",
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+        cookies_file = pathlib.Path(cookies_raw).expanduser() if cookies_raw and cookies_raw.strip() else None
+
         return cls(
             token=token,
             port=port,
             download_dir=download_dir,
             ytdlp_command=ytdlp_command,
             concurrent_fragments=fragments,
+            cookies_file=cookies_file,
         )
 
     @classmethod
@@ -385,6 +419,9 @@ def validate_cookie_options(raw: Any) -> dict[str, Any]:
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise BridgeError("Cookie enabled must be true or false.", code="invalid_cookie_options")
+    source = str(raw.get("source", "browser")).lower()
+    if source not in COOKIE_SOURCES:
+        raise BridgeError("Unsupported cookie source.", code="invalid_cookie_options")
     browser = str(raw.get("browser", "firefox")).lower()
     if browser not in COOKIE_BROWSERS:
         raise BridgeError("Unsupported cookie browser.", code="invalid_cookie_options")
@@ -397,6 +434,7 @@ def validate_cookie_options(raw: Any) -> dict[str, Any]:
         raise BridgeError("Firefox containers can only be used with Firefox cookies.", code="invalid_cookie_options")
     return {
         "enabled": enabled,
+        "source": source,
         "browser": browser,
         "profile": profile,
         "keyring": keyring,
@@ -404,8 +442,12 @@ def validate_cookie_options(raw: Any) -> dict[str, Any]:
     }
 
 
+def uses_cookie_file(options: Mapping[str, Any]) -> bool:
+    return bool(options.get("enabled")) and options.get("source", "browser") == "file"
+
+
 def cookie_spec(options: Mapping[str, Any]) -> str | None:
-    if not options.get("enabled"):
+    if not options.get("enabled") or uses_cookie_file(options):
         return None
     spec = str(options["browser"])
     if options.get("keyring"):
@@ -716,7 +758,11 @@ def sanitize_info(raw: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def cookie_args(options: Mapping[str, Any]) -> list[str]:
+def cookie_args(options: Mapping[str, Any], cookies_file: pathlib.Path | None = None) -> list[str]:
+    if uses_cookie_file(options):
+        if cookies_file is None:
+            raise BridgeError("No cookies file was prepared for this run.", code="cookies_file_missing")
+        return ["--cookies", str(cookies_file)]
     spec = cookie_spec(options)
     return ["--cookies-from-browser", spec] if spec else []
 
@@ -731,9 +777,191 @@ def certificate_args(allow_invalid_certificates: Any) -> list[str]:
     return ["--no-check-certificates"] if allow_invalid_certificates else []
 
 
+def sign_in_hint(
+    error_text: str,
+    cookie_options: Mapping[str, Any],
+    *,
+    cookies_rejected: bool = False,
+) -> str | None:
+    """Explain an error caused by YouTube refusing to serve this connection signed out."""
+    bot_check = BOT_CHECK_MARKER in error_text.lower()
+    if cookies_rejected or (bot_check and cookie_options.get("enabled")):
+        return COOKIES_REJECTED_HINTS[str(cookie_options.get("source", "browser"))]
+    return BOT_CHECK_HINT if bot_check else None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CookieEntry:
+    line: str = dataclasses.field(compare=False)
+    value: str
+    expires: float
+
+
+CookieKey = tuple[str, str, str]
+
+
+def parse_cookie_file(text: str) -> dict[CookieKey, CookieEntry]:
+    """Read a Netscape cookies file the way yt-dlp does, keyed by domain, path and name."""
+    entries: dict[CookieKey, CookieEntry] = {}
+    for line in text.splitlines():
+        body = line[len(HTTPONLY_PREFIX) :] if line.startswith(HTTPONLY_PREFIX) else line
+        if not body.strip() or body.startswith("#"):
+            continue
+        fields = body.split("\t")
+        if len(fields) != 7:
+            continue
+        domain, _subdomains, path, _secure, expires, name, value = fields
+        try:
+            expires_at = float(expires or 0)
+        except ValueError:
+            continue
+        entries[(domain, path, name)] = CookieEntry(line, value, expires_at)
+    return entries
+
+
+def merge_cookie_changes(
+    base: Mapping[CookieKey, CookieEntry],
+    ours: Mapping[CookieKey, CookieEntry],
+    theirs: Mapping[CookieKey, CookieEntry],
+) -> dict[CookieKey, CookieEntry]:
+    """Apply what one run changed (base to ours) to the shared file as it is now (theirs).
+
+    When another run already changed the same cookie, the later expiry wins:
+    YouTube issues rotated cookies with a fixed lifetime, so it marks the later
+    rotation. Cookies a run deleted stay in place. YouTube deletes them when it
+    signs a session out, and keeping them lets the next run report that again
+    instead of running signed out without a word.
+    """
+    merged = dict(theirs)
+    for key, after in ours.items():
+        before, current = base.get(key), theirs.get(key)
+        if after == before:
+            continue
+        if current is not None and current != before and current.expires > after.expires:
+            continue
+        merged[key] = after
+    return merged
+
+
+class CookieFileStore:
+    """Hands each yt-dlp run a private copy of the configured cookies file and
+    merges what the run changed back into it.
+
+    yt-dlp rewrites its --cookies file on exit with the cookies YouTube rotated
+    during the run, which is what keeps an exported session signed in. Runs
+    cannot share the file directly: a download that started before a metadata
+    request would save its older cookies over the newer ones when it finishes.
+    """
+
+    def __init__(self, path: pathlib.Path | None) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._signature: tuple[int, int, int] | None = None
+        # Bumped whenever the file changes outside the bridge, such as a fresh
+        # export; runs checked out before that hold the old session.
+        self._epoch = 0
+
+    def require(self) -> pathlib.Path:
+        if self.path is None:
+            raise BridgeError(
+                'No cookies file is configured. Add "cookies_file" to the companion\'s config.json, then restart it.',
+                code="cookies_file_not_configured",
+                status=HTTPStatus.CONFLICT,
+            )
+        path = self.path.resolve()
+        if not path.is_file():
+            raise BridgeError(
+                f"The cookies file configured in the companion was not found: {path}",
+                code="cookies_file_missing",
+                status=HTTPStatus.CONFLICT,
+            )
+        return path
+
+    @contextlib.contextmanager
+    def checkout(self, cookie_options: Mapping[str, Any]) -> Iterator[pathlib.Path | None]:
+        if not uses_cookie_file(cookie_options):
+            yield None
+            return
+        master = self.require()
+        with self._lock:
+            try:
+                self._note_external_change(master)
+                text = master.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise BridgeError(
+                    f"Could not read the cookies file: {clean_text(exc, 300)}",
+                    code="cookies_file_unreadable",
+                    status=HTTPStatus.CONFLICT,
+                ) from exc
+            epoch = self._epoch
+        workspace = pathlib.Path(tempfile.mkdtemp(prefix="vm-ytdlp-cookies-"))
+        private = workspace / "cookies.txt"
+        try:
+            private.write_text(text, encoding="utf-8")
+            yield private
+        finally:
+            try:
+                self._check_in(master, private, parse_cookie_file(text), epoch)
+            finally:
+                shutil.rmtree(workspace, ignore_errors=True)
+
+    @staticmethod
+    def _stat_signature(path: pathlib.Path) -> tuple[int, int, int]:
+        stat = path.stat()
+        return (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+    def _note_external_change(self, path: pathlib.Path) -> None:
+        signature = self._stat_signature(path)
+        if signature != self._signature:
+            self._signature = signature
+            self._epoch += 1
+
+    def _check_in(self, master: pathlib.Path, private: pathlib.Path, base: Mapping[CookieKey, CookieEntry], epoch: int) -> None:
+        try:
+            text = private.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return
+        # yt-dlp rewrites the file in place on exit, so a run killed while saving
+        # leaves a cut-off last line that must not be merged.
+        if not text.endswith("\n"):
+            return
+        ours = parse_cookie_file(text)
+        if ours == base:
+            return
+        with self._lock:
+            try:
+                self._note_external_change(master)
+                if epoch != self._epoch:
+                    return
+                theirs = parse_cookie_file(master.read_text(encoding="utf-8"))
+                merged = merge_cookie_changes(base, ours, theirs)
+                if merged == theirs:
+                    return
+                self._write(master, merged)
+                self._signature = self._stat_signature(master)
+            except (OSError, UnicodeDecodeError) as exc:
+                sys.stderr.write(f"[bridge] Could not update the cookies file: {clean_text(exc, 240)}\n")
+
+    @staticmethod
+    def _write(path: pathlib.Path, entries: Mapping[CookieKey, CookieEntry]) -> None:
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(COOKIE_FILE_HEADER)
+                handle.writelines(f"{entry.line}\n" for entry in entries.values())
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
 class YtDlpRunner:
     def __init__(self, config: BridgeConfig) -> None:
         self.config = config
+        self.cookie_store = CookieFileStore(config.cookies_file)
         self._info_slots = threading.BoundedSemaphore(2)
         self._version_lock = threading.Lock()
         self._cached_version: str | None = None
@@ -789,31 +1017,35 @@ class YtDlpRunner:
         if not self._info_slots.acquire(timeout=2):
             raise BridgeError("Too many metadata requests are already running. Try again shortly.", code="busy", status=429)
         try:
-            command = [
-                *self.command,
-                "--ignore-config",
-                "--no-playlist",
-                "--skip-download",
-                "--dump-single-json",
-                "--no-warnings",
-                "--socket-timeout",
-                "20",
-                "--extractor-retries",
-                "3",
-                *self.javascript_runtime_args(),
-                *cookie_args(cookie_options),
-                *proxy_args(validated_proxy),
-                *certificate_args(allow_invalid_certificates),
-                "--",
-                canonical_url,
-            ]
-            return_code, stdout_text, stderr_text = self._run_metadata_process(command)
+            with self.cookie_store.checkout(cookie_options) as cookies_file:
+                command = [
+                    *self.command,
+                    "--ignore-config",
+                    "--no-playlist",
+                    "--skip-download",
+                    "--dump-single-json",
+                    "--no-warnings",
+                    "--socket-timeout",
+                    "20",
+                    "--extractor-retries",
+                    "3",
+                    *self.javascript_runtime_args(),
+                    *cookie_args(cookie_options, cookies_file),
+                    *proxy_args(validated_proxy),
+                    *certificate_args(allow_invalid_certificates),
+                    "--",
+                    canonical_url,
+                ]
+                return_code, stdout_text, stderr_text = self._run_metadata_process(command)
 
             if return_code != 0:
                 reason = clean_block(
                     redact_proxy_reference("\n".join((stderr_text or stdout_text).splitlines()[-12:]), validated_proxy),
                     1800,
                 )
+                hint = sign_in_hint(reason, cookie_options)
+                if hint:
+                    reason = f"{reason}\n{hint}" if reason else hint
                 raise BridgeError(
                     "yt-dlp could not read this video's formats.",
                     code="metadata_failed",
@@ -954,7 +1186,7 @@ class YtDlpRunner:
         except (OSError, ProcessLookupError):
             pass
 
-    def build_download_command(self, options: Mapping[str, Any]) -> list[str]:
+    def build_download_command(self, options: Mapping[str, Any], cookies_file: pathlib.Path | None = None) -> list[str]:
         download_dir = self.config.download_dir.expanduser().resolve()
         temporary_dir = download_dir / ".vm-yt-dlp-parts"
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -1020,7 +1252,7 @@ class YtDlpRunner:
             "--print",
             f"after_move:{OUTPUT_PREFIX}%(filepath)s",
             *self.javascript_runtime_args(),
-            *cookie_args(options["cookies"]),
+            *cookie_args(options["cookies"], cookies_file),
             *proxy_args(validated_proxy),
             *certificate_args(options.get("allow_invalid_certificates", False)),
         ]
@@ -1128,6 +1360,8 @@ class JobManager:
 
     def enqueue(self, raw: Any) -> dict[str, Any]:
         options = validate_job_payload(raw)
+        if uses_cookie_file(options["cookies"]):
+            self.runner.cookie_store.require()
         with self._lock:
             self._prune_if_needed()
             job_id = uuid.uuid4().hex
@@ -1183,6 +1417,8 @@ class JobManager:
 
     def resume(self, job_id: str, raw: Any) -> dict[str, Any]:
         network_options = validate_resume_payload(raw)
+        if uses_cookie_file(network_options["cookies"]):
+            self.runner.cookie_store.require()
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -1472,7 +1708,6 @@ class JobManager:
             max_attempts = int(job["max_attempts"])
 
         try:
-            command = self.runner.build_download_command(options)
             for attempt in range(1, max_attempts + 1):
                 with self._lock:
                     job = self._jobs.get(job_id)
@@ -1495,7 +1730,9 @@ class JobManager:
                     job["_cookies_rejected"] = False
                     self._touch(job)
 
-                return_code, start_error = self._run_process_attempt(job_id, options, command)
+                with self.runner.cookie_store.checkout(options["cookies"]) as cookies_file:
+                    command = self.runner.build_download_command(options, cookies_file)
+                    return_code, start_error = self._run_process_attempt(job_id, options, command)
 
                 with self._lock:
                     job = self._jobs.get(job_id)
@@ -1601,7 +1838,7 @@ class JobManager:
                         if not job["_cookies_rejected"]:
                             job["_cookies_rejected"] = True
                             self._append_log(job, line)
-                            self._append_log(job, f"[bridge] {COOKIES_REJECTED_HINT}")
+                            self._append_log(job, f"[bridge] {sign_in_hint(line, options['cookies'], cookies_rejected=True)}")
                     else:
                         self._append_log(job, line)
                         lower = line.lower()
@@ -1613,9 +1850,10 @@ class JobManager:
                             job["phase"] = "Reading video data"
                             self._touch(job)
                         if line.startswith("ERROR:"):
-                            # After a rejection this is typically "Sign in to confirm...",
-                            # which is unexplained without the reason the account was dropped.
-                            job["error"] = f"{line}\n{COOKIES_REJECTED_HINT}" if job["_cookies_rejected"] else line
+                            # "Sign in to confirm..." says nothing about why the connection
+                            # was signed out, which is what the user can act on.
+                            hint = sign_in_hint(line, options["cookies"], cookies_rejected=job["_cookies_rejected"])
+                            job["error"] = f"{line}\n{hint}" if hint else line
                     should_cancel = bool(job["cancel_requested"])
                 if should_cancel and process.poll() is None:
                     self._terminate_process(process)
@@ -1993,12 +2231,15 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                             "job_retries",
                             "download_modes_v2",
                             "persistent_resume",
+                            "cookies_file",
                         ],
                         "yt_dlp_version": self.server.runner.version(),
                         "ffmpeg_available": shutil.which("ffmpeg") is not None,
                         "javascript_runtime_available": self.server.runner.javascript_runtime() is not None,
                         "javascript_runtime": self.server.runner.javascript_runtime(),
                         "download_dir": str(self.server.config.download_dir.expanduser()),
+                        "cookies_file_configured": self.server.config.cookies_file is not None,
+                        "cookies_file_found": bool(self.server.config.cookies_file and self.server.config.cookies_file.is_file()),
                     },
                 )
                 return
@@ -2202,6 +2443,12 @@ def run_doctor(config: BridgeConfig) -> int:
         ("ffmpeg", shutil.which("ffmpeg") or "NOT FOUND"),
         ("JavaScript runtime", runner.javascript_runtime() or "NOT FOUND"),
         ("Download directory", str(config.download_dir.expanduser())),
+        (
+            "Cookies file",
+            "not configured"
+            if config.cookies_file is None
+            else f"{config.cookies_file}{'' if config.cookies_file.is_file() else ' (NOT FOUND)'}",
+        ),
         ("Bridge address", f"http://127.0.0.1:{config.port}"),
     ]
     width = max(len(name) for name, _ in checks)

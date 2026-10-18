@@ -60,6 +60,7 @@
     token: '',
     apiBase: 'http://127.0.0.1:17442',
     cookieEnabled: false,
+    cookieSource: 'browser',
     cookieBrowser: /firefox/i.test(navigator.userAgent) ? 'firefox' : 'chrome',
     cookieProfile: '',
     cookieKeyring: '',
@@ -211,6 +212,7 @@
   function cookiePayload() {
     return {
       enabled: state.settings.cookieEnabled,
+      source: state.settings.cookieSource === 'file' ? 'file' : 'browser',
       browser: state.settings.cookieBrowser,
       profile: state.settings.cookieProfile,
       keyring: state.settings.cookieKeyring,
@@ -225,7 +227,8 @@
   async function requireNetworkCapabilities() {
     const needsProxy = Boolean(proxyPayload());
     const needsInvalidCertificates = state.settings.allowInvalidCertificates === true;
-    if (!needsProxy && !needsInvalidCertificates) return;
+    const needsCookieFile = state.settings.cookieEnabled && state.settings.cookieSource === 'file';
+    if (!needsProxy && !needsInvalidCertificates && !needsCookieFile) return;
     if (!state.health) await testConnection(false);
     const capabilities = Array.isArray(state.health?.capabilities) ? state.health.capabilities : [];
     if (needsProxy && !capabilities.includes('proxy')) {
@@ -233,6 +236,9 @@
     }
     if (needsInvalidCertificates && !capabilities.includes('invalid_certificates')) {
       throw new ApiError('Invalid-certificate support requires the version 1.2.0 or newer local companion. Update the bridge, then try again.', 'invalid_certificates_not_supported');
+    }
+    if (needsCookieFile && !capabilities.includes('cookies_file')) {
+      throw new ApiError('Cookies-file sign-in requires an updated local companion. Update the bridge, then try again.', 'cookies_file_not_supported');
     }
   }
 
@@ -2002,6 +2008,17 @@
     }
   }
 
+  function cookieFileHelper() {
+    const configured = state.health?.cookies_file_configured;
+    if (configured === true && state.health?.cookies_file_found === false) {
+      return `<div class="vm-helper warning vm-field full" style="margin-top:0">${ICONS.alert}<span>The cookies file named in the companion's config.json was not found. Export a cookies.txt from a private window and save it at that path.</span></div>`;
+    }
+    if (configured === true) {
+      return `<div class="vm-helper vm-field full" style="margin-top:0">${ICONS.check}<span>The companion uses its configured cookies file and saves the cookies YouTube refreshes back into it. Export the file from a private window and close that window, so no browser keeps using the same session.</span></div>`;
+    }
+    return `<div class="vm-helper warning vm-field full" style="margin-top:0">${ICONS.alert}<span>${configured === false ? 'No cookies file is configured.' : 'Connect to the companion to check its cookies file.'} Set "cookies_file" in the companion's config.json to a cookies.txt exported from a private window, then restart the companion.</span></div>`;
+  }
+
   function renderSettings() {
     const s = state.settings;
     replaceMarkup(content, `
@@ -2041,14 +2058,21 @@
       </section>
 
       <section class="vm-settings-group vm-card">
-        <h3 class="vm-settings-title">${ICONS.folder} Browser authentication</h3>
-        <p class="vm-settings-copy">When enabled, yt-dlp reads cookies directly from the selected local profile. Cookies never pass through YouTube or this userscript.</p>
+        <h3 class="vm-settings-title">${ICONS.folder} Account cookies</h3>
+        <p class="vm-settings-copy">When enabled, yt-dlp reads cookies itself, from a local browser profile or from the cookies file named in the companion's config. Cookies never pass through YouTube or this userscript.</p>
         <label class="vm-inline-toggle vm-setting-row">
-          <span class="vm-toggle-copy"><strong>Use browser cookies</strong><small>Useful for age-restricted, private, and members-only videos you can access</small></span>
+          <span class="vm-toggle-copy"><strong>Use account cookies</strong><small>For age-restricted, private, and members-only videos you can access, or when YouTube asks to confirm you're not a bot</small></span>
           <span class="vm-switch"><input type="checkbox" data-setting="cookieEnabled" ${s.cookieEnabled ? 'checked' : ''}><span></span></span>
         </label>
         <div class="vm-grid" style="margin-top:12px">
-          <label class="vm-field">
+          <label class="vm-field full">
+            <span class="vm-label">Cookie source</span>
+            <select class="vm-select" data-setting="cookieSource">
+              <option value="browser" ${s.cookieSource !== 'file' ? 'selected' : ''}>Browser profile</option>
+              <option value="file" ${s.cookieSource === 'file' ? 'selected' : ''}>Cookies file (recommended with a proxy)</option>
+            </select>
+          </label>
+          ${s.cookieSource === 'file' ? cookieFileHelper() : `<label class="vm-field">
             <span class="vm-label">Browser</span>
             <select class="vm-select" data-setting="cookieBrowser">
               ${['firefox','chrome','chromium','brave','edge','vivaldi','opera','safari'].map((browser) => `<option value="${browser}" ${s.cookieBrowser === browser ? 'selected' : ''}>${browser[0].toUpperCase() + browser.slice(1)}</option>`).join('')}
@@ -2065,7 +2089,7 @@
             <span class="vm-label">Profile name or path <span>optional</span></span>
             <input class="vm-input" data-setting="cookieProfile" value="${h(s.cookieProfile)}" placeholder="Most recently used profile">
           </label>
-          ${s.cookieBrowser === 'firefox' ? `<label class="vm-field full"><span class="vm-label">Firefox container <span>optional</span></span><input class="vm-input" data-setting="cookieContainer" value="${h(s.cookieContainer)}" placeholder="All containers"></label>` : ''}
+          ${s.cookieBrowser === 'firefox' ? `<label class="vm-field full"><span class="vm-label">Firefox container <span>optional</span></span><input class="vm-input" data-setting="cookieContainer" value="${h(s.cookieContainer)}" placeholder="All containers"></label>` : ''}`}
         </div>
       </section>
 
@@ -2121,15 +2145,17 @@
       const status = content.querySelector('[data-proxy-state]');
       if (status) status.textContent = event.target.checked ? 'enabled' : 'disabled';
     });
-    content.querySelector('[data-setting="cookieBrowser"]')?.addEventListener('change', (event) => {
-      try {
-        state.settings = collectSettings();
-        state.settings.cookieBrowser = event.target.value;
-        renderSettings();
-      } catch (error) {
-        toast(error.message, true);
-      }
-    });
+    for (const key of ['cookieBrowser', 'cookieSource']) {
+      content.querySelector(`[data-setting="${key}"]`)?.addEventListener('change', (event) => {
+        try {
+          state.settings = collectSettings();
+          state.settings[key] = event.target.value;
+          renderSettings();
+        } catch (error) {
+          toast(error.message, true);
+        }
+      });
+    }
     content.querySelector('[data-action="save-settings"]')?.addEventListener('click', async () => {
       try {
         state.settings = collectSettings();
