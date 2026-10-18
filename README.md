@@ -100,6 +100,7 @@ Open the panel's **Settings** tab and enable **Use browser cookies**. Pick the b
 - Firefox containers are supported through the optional container field.
 - Linux Chromium browsers may require the correct keyring selection.
 - On some platforms, Chromium locks its cookie database while the browser is running. If extraction fails, close that browser briefly and retry, or use a separate profile.
+- `The provided YouTube account cookies are no longer valid` means YouTube signed out the session yt-dlp read from your browser, and the download continued without your account. Public videos are unaffected. Open YouTube tabs keep rotating the login cookies while yt-dlp reads the copy saved on disk, which can lag behind. If the video needs your account, confirm that the selected browser and profile are signed in to YouTube, close that browser completely so it saves its current cookies, then resume. The companion logs this warning once with an explanation instead of repeating it after every request.
 
 Cookie files and cookie values are never sent to the userscript. The companion only asks yt-dlp to read them locally for the requested download.
 
