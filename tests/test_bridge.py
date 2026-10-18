@@ -52,6 +52,28 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(bridge.BridgeError):
             bridge.validate_cookie_options({"enabled": "false", "browser": "firefox"})
 
+    def test_cookie_source_selects_browser_or_configured_file(self) -> None:
+        self.assertEqual(bridge.validate_cookie_options({"enabled": True})["source"], "browser")
+        options = bridge.validate_cookie_options({"enabled": True, "source": "file", "browser": "chrome"})
+        self.assertIsNone(bridge.cookie_spec(options))
+        self.assertEqual(bridge.cookie_args(options, pathlib.Path("/tmp/run/cookies.txt")), ["--cookies", "/tmp/run/cookies.txt"])
+        with self.assertRaises(bridge.BridgeError):
+            bridge.cookie_args(options)
+        with self.assertRaises(bridge.BridgeError):
+            bridge.validate_cookie_options({"enabled": True, "source": "/etc/passwd"})
+
+    def test_cookies_file_comes_only_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = pathlib.Path(temp) / "config.json"
+            path.write_text(json.dumps({"token": "t" * 48, "cookies_file": "~/yt-cookies.txt"}), encoding="utf-8")
+            config = bridge.BridgeConfig.load(path)
+            self.assertEqual(config.cookies_file, pathlib.Path.home() / "yt-cookies.txt")
+            path.write_text(json.dumps({"token": "t" * 48}), encoding="utf-8")
+            self.assertIsNone(bridge.BridgeConfig.load(path).cookies_file)
+            path.write_text(json.dumps({"token": "t" * 48, "cookies_file": ["x"]}), encoding="utf-8")
+            with self.assertRaises(bridge.BridgeError):
+                bridge.BridgeConfig.load(path)
+
     def test_proxy_url_validation_accepts_supported_schemes_and_auth(self) -> None:
         values = (
             "http://127.0.0.1:8080",
@@ -517,22 +539,45 @@ class RunnerTests(unittest.TestCase):
 
     def test_rejected_cookies_warning_is_logged_once_with_an_explanation(self) -> None:
         request = base_job()
+        request["cookies"] = {"enabled": True, "browser": "firefox"}
         request["selection"]["video_format_id"] = "cookiesrotated"
         current = self.run_job_to_end(request)
         self.assertEqual(current["status"], "completed", current)
         warnings = [line for line in current["logs"] if "cookies are no longer valid" in line]
         self.assertEqual(len(warnings), 1, current["logs"])
-        self.assertEqual(current["logs"].count(f"[bridge] {bridge.COOKIES_REJECTED_HINT}"), 1)
+        self.assertEqual(current["logs"].count(f"[bridge] {bridge.COOKIES_REJECTED_HINTS['browser']}"), 1)
         self.assertIsNone(current["error"])
 
     def test_sign_in_error_after_rejected_cookies_carries_the_explanation(self) -> None:
         request = base_job()
+        request["cookies"] = {"enabled": True, "browser": "firefox"}
         request["selection"]["video_format_id"] = "cookiesrotated-signin"
         request["retry_count"] = 0
         current = self.run_job_to_end(request)
         self.assertEqual(current["status"], "failed", current)
         self.assertTrue(current["error"].startswith("ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age."))
-        self.assertIn(bridge.COOKIES_REJECTED_HINT, current["error"])
+        self.assertIn(bridge.COOKIES_REJECTED_HINTS["browser"], current["error"])
+
+    def test_bot_check_explains_a_flagged_connection(self) -> None:
+        request = base_job()
+        request["selection"]["video_format_id"] = "botcheck"
+        request["retry_count"] = 0
+        current = self.run_job_to_end(request)
+        self.assertEqual(current["status"], "failed", current)
+        self.assertIn("not a bot", current["error"])
+        self.assertIn(bridge.BOT_CHECK_HINT, current["error"])
+
+    def test_metadata_bot_check_reason_names_the_fix_for_the_cookie_setting(self) -> None:
+        url = "https://www.youtube.com/watch?v=botcheck00"
+        for cookies, hint in (
+            ({"enabled": False}, bridge.BOT_CHECK_HINT),
+            ({"enabled": True, "browser": "firefox"}, bridge.COOKIES_REJECTED_HINTS["browser"]),
+        ):
+            with self.subTest(cookies=cookies), self.assertRaises(bridge.BridgeError) as caught:
+                self.runner.extract_info(url, cookies)
+            self.assertEqual(caught.exception.code, "metadata_failed")
+            self.assertIn("not a bot", caught.exception.details["reason"])
+            self.assertTrue(caught.exception.details["reason"].endswith(hint))
 
     def test_job_can_be_cancelled_during_retry_backoff(self) -> None:
         request = base_job()
@@ -562,6 +607,147 @@ class RunnerTests(unittest.TestCase):
                 time.sleep(0.02)
         self.assertEqual(current["status"], "cancelled", current)
         self.assertEqual(current["attempt"], 1)
+
+
+COOKIE_EXPORT = (
+    "# Netscape HTTP Cookie File\n"
+    "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1900000000\tLOGIN_INFO\tlogin-value\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1900000000\t__Secure-1PSIDTS\tsidts-1\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1900000000\tSIDCC\tsidcc-1\n"
+    ".youtube.com\tTRUE\t/\tTRUE\t1900000000\tSAPISID\tsapisid\n"
+)
+FILE_COOKIES = {"enabled": True, "source": "file", "browser": "firefox"}
+
+
+def set_cookie(path: pathlib.Path, name: str, value: str | None, expires: int = 1900000000) -> None:
+    """Rewrite one cookie in a run's private file the way yt-dlp saves it."""
+    lines = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.removeprefix("#HttpOnly_")
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if fields[5] == name:
+            if value is None:
+                continue
+            fields[4], fields[6] = str(expires), value
+        lines.append("\t".join(fields))
+    path.write_text("# Netscape HTTP Cookie File\n\n" + "".join(f"{line}\n" for line in lines), encoding="utf-8")
+
+
+class CookieFileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.master = pathlib.Path(self.temp.name) / "cookies.txt"
+        self.master.write_text(COOKIE_EXPORT, encoding="utf-8")
+        self.store = bridge.CookieFileStore(self.master)
+
+    def values(self) -> dict[str, str]:
+        entries = bridge.parse_cookie_file(self.master.read_text(encoding="utf-8"))
+        return {name: entry.value for (_domain, _path, name), entry in entries.items()}
+
+    def test_run_gets_a_private_copy_and_its_rotation_is_kept(self) -> None:
+        with self.store.checkout(FILE_COOKIES) as private:
+            self.assertNotEqual(private, self.master)
+            self.assertEqual(private.read_text(encoding="utf-8"), COOKIE_EXPORT)
+            set_cookie(private, "__Secure-1PSIDTS", "sidts-2", 1900000001)
+        self.assertFalse(private.exists())
+        self.assertEqual(self.values()["__Secure-1PSIDTS"], "sidts-2")
+        # Untouched cookies keep their original lines, HttpOnly marker included.
+        self.assertIn("#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1900000000\tLOGIN_INFO\tlogin-value\n", self.master.read_text())
+        if os.name != "nt":
+            self.assertEqual(self.master.stat().st_mode & 0o777, 0o600)
+
+    def test_older_run_finishing_last_does_not_undo_a_newer_rotation(self) -> None:
+        with self.store.checkout(FILE_COOKIES) as download:
+            with self.store.checkout(FILE_COOKIES) as metadata:
+                set_cookie(metadata, "__Secure-1PSIDTS", "sidts-3", 1900000002)
+            set_cookie(download, "__Secure-1PSIDTS", "sidts-2", 1900000001)
+            set_cookie(download, "SIDCC", "sidcc-2", 1900000001)
+        values = self.values()
+        self.assertEqual(values["__Secure-1PSIDTS"], "sidts-3")
+        self.assertEqual(values["SIDCC"], "sidcc-2")
+
+    def test_a_fresh_export_replacing_the_file_mid_run_is_kept(self) -> None:
+        fresh = COOKIE_EXPORT.replace("sidts-1", "fresh-session-1").replace("login-value", "fresh-login")
+        with self.store.checkout(FILE_COOKIES) as private:
+            self.master.write_text(fresh, encoding="utf-8")
+            set_cookie(private, "__Secure-1PSIDTS", "sidts-2", 1900000001)
+        self.assertEqual(self.master.read_text(encoding="utf-8"), fresh)
+
+    def test_deletions_and_cut_off_saves_are_not_merged(self) -> None:
+        with self.store.checkout(FILE_COOKIES) as private:
+            set_cookie(private, "LOGIN_INFO", None)
+        self.assertEqual(self.values()["LOGIN_INFO"], "login-value")
+        with self.store.checkout(FILE_COOKIES) as private:
+            set_cookie(private, "__Secure-1PSIDTS", "sidts-2", 1900000001)
+            private.write_text(private.read_text(encoding="utf-8").rstrip("\n")[:-3], encoding="utf-8")
+        self.assertEqual(self.master.read_text(encoding="utf-8"), COOKIE_EXPORT)
+
+    def test_browser_cookies_and_missing_files_are_handled_before_running(self) -> None:
+        with self.store.checkout({"enabled": True, "source": "browser", "browser": "firefox"}) as private:
+            self.assertIsNone(private)
+        with self.assertRaises(bridge.BridgeError) as caught:
+            bridge.CookieFileStore(None).require()
+        self.assertEqual(caught.exception.code, "cookies_file_not_configured")
+        with self.assertRaises(bridge.BridgeError) as caught:
+            bridge.CookieFileStore(self.master.with_name("missing.txt")).require()
+        self.assertEqual(caught.exception.code, "cookies_file_missing")
+
+    def test_metadata_and_download_runs_write_rotations_back(self) -> None:
+        config = bridge.BridgeConfig(
+            token="t" * 48,
+            port=17442,
+            download_dir=pathlib.Path(self.temp.name) / "downloads",
+            ytdlp_command=(sys.executable, str(FAKE_YTDLP)),
+            cookies_file=self.master,
+        )
+        runner = bridge.YtDlpRunner(config)
+        captured_commands = []
+        real_popen = subprocess.Popen
+
+        def capture_popen(command, **kwargs):
+            captured_commands.append(list(command))
+            return real_popen(command, **kwargs)
+
+        with mock.patch.object(bridge.subprocess, "Popen", side_effect=capture_popen):
+            runner.extract_info(VIDEO_URL, FILE_COOKIES)
+        cookie_path = captured_commands[0][captured_commands[0].index("--cookies") + 1]
+        self.assertNotEqual(pathlib.Path(cookie_path), self.master)
+        self.assertNotIn("--cookies-from-browser", captured_commands[0])
+        self.assertEqual(self.values()["__Secure-1PSIDTS"], "sidts-2")
+
+        jobs = bridge.JobManager(runner)
+        self.addCleanup(jobs.stop)
+        request = base_job()
+        request["cookies"] = FILE_COOKIES
+        created = jobs.enqueue(request)
+        deadline = time.monotonic() + 4
+        current = created
+        while time.monotonic() < deadline:
+            current = jobs.get_job(created["id"])
+            if current["status"] in bridge.TERMINAL_STATUSES:
+                break
+            time.sleep(0.02)
+        self.assertEqual(current["status"], "completed", current)
+        self.assertEqual(self.values()["__Secure-1PSIDTS"], "sidts-3")
+
+    def test_jobs_asking_for_an_unconfigured_file_are_refused_up_front(self) -> None:
+        config = bridge.BridgeConfig(
+            token="t" * 48,
+            port=17442,
+            download_dir=pathlib.Path(self.temp.name) / "downloads",
+            ytdlp_command=(sys.executable, str(FAKE_YTDLP)),
+        )
+        jobs = bridge.JobManager(bridge.YtDlpRunner(config))
+        self.addCleanup(jobs.stop)
+        request = base_job()
+        request["cookies"] = FILE_COOKIES
+        with self.assertRaises(bridge.BridgeError) as caught:
+            jobs.enqueue(request)
+        self.assertEqual(caught.exception.code, "cookies_file_not_configured")
+        self.assertEqual(jobs.list_jobs()["jobs"], [])
 
 
 class PairingTests(unittest.TestCase):
@@ -632,6 +818,9 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("job_retries", payload["capabilities"])
         self.assertIn("download_modes_v2", payload["capabilities"])
         self.assertIn("persistent_resume", payload["capabilities"])
+        self.assertIn("cookies_file", payload["capabilities"])
+        self.assertFalse(payload["cookies_file_configured"])
+        self.assertFalse(payload["cookies_file_found"])
 
     def test_origin_and_host_protection(self) -> None:
         request = urllib.request.Request(
