@@ -121,6 +121,19 @@ if "flaky" in format_value:
         print("ERROR: simulated transient download failure", flush=True)
         raise SystemExit(1)
 
+if "cookiesrotated" in format_value:
+    # yt-dlp repeats this after every request once YouTube signs the session out.
+    for _ in range(3):
+        print(
+            "WARNING: [youtube] The provided YouTube account cookies are no longer valid. They have "
+            "likely been rotated in the browser as a security measure. For tips on how to effectively "
+            "export YouTube cookies, refer to  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies .",
+            flush=True,
+        )
+    if "signin" in format_value:
+        print("ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age.", flush=True)
+        raise SystemExit(1)
+
 if "slow" in format_value:
     for index in range(1, 101):
         print(f"__VMYTDLP_PROGRESS__{index}|100|NA|10|{100 - index}|{index}|100", flush=True)

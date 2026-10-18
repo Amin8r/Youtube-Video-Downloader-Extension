@@ -55,6 +55,16 @@ JOB_RETRY_MAX_SECONDS = 30.0
 
 PROGRESS_PREFIX = "__VMYTDLP_PROGRESS__"
 OUTPUT_PREFIX = "__VMYTDLP_OUTPUT__"
+# yt-dlp prints this after every request once YouTube has signed the borrowed
+# browser session out, so a single rejection fills the log with identical lines
+# that do not say whether the download is affected.
+COOKIES_REJECTED_MARKER = "provided youtube account cookies are no longer valid"
+COOKIES_REJECTED_HINT = (
+    "YouTube rejected the signed-in cookies yt-dlp read from your browser, so it continued "
+    "without your account. Public videos still download normally. If this video needs your "
+    "account, check the cookie browser and profile in Settings, close that browser completely "
+    "so it saves its current cookies, then resume. Otherwise, turn off Use browser cookies."
+)
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 RESUMABLE_STATUSES = frozenset({"interrupted", "failed", "cancelled"})
@@ -1300,6 +1310,7 @@ class JobManager:
             "_stream_weights": list(options.get("expected_bytes") or []) or None,
             "_stream_index": 0,
             "_stream_last_downloaded": None,
+            "_cookies_rejected": False,
             "options": dict(options),
         }
 
@@ -1481,6 +1492,7 @@ class JobManager:
                     job["_speed_accumulated_bytes"] = 0.0
                     job["_stream_index"] = 0
                     job["_stream_last_downloaded"] = None
+                    job["_cookies_rejected"] = False
                     self._touch(job)
 
                 return_code, start_error = self._run_process_attempt(job_id, options, command)
@@ -1585,6 +1597,11 @@ class JobManager:
                     elif line.startswith(OUTPUT_PREFIX):
                         job["output_path"] = clean_text(line[len(OUTPUT_PREFIX) :], 1800)
                         self._touch(job)
+                    elif COOKIES_REJECTED_MARKER in line.lower():
+                        if not job["_cookies_rejected"]:
+                            job["_cookies_rejected"] = True
+                            self._append_log(job, line)
+                            self._append_log(job, f"[bridge] {COOKIES_REJECTED_HINT}")
                     else:
                         self._append_log(job, line)
                         lower = line.lower()
@@ -1596,7 +1613,9 @@ class JobManager:
                             job["phase"] = "Reading video data"
                             self._touch(job)
                         if line.startswith("ERROR:"):
-                            job["error"] = line
+                            # After a rejection this is typically "Sign in to confirm...",
+                            # which is unexplained without the reason the account was dropped.
+                            job["error"] = f"{line}\n{COOKIES_REJECTED_HINT}" if job["_cookies_rejected"] else line
                     should_cancel = bool(job["cancel_requested"])
                 if should_cancel and process.poll() is None:
                     self._terminate_process(process)

@@ -5,6 +5,20 @@ All notable changes to yt-dlp for Violentmonkey are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Rejected browser cookies are explained instead of repeated.** When YouTube
+  signs out the session read through **Use browser cookies**, yt-dlp prints
+  `The provided YouTube account cookies are no longer valid` after every later
+  request, which filled the job log with identical warnings that did not say
+  whether the download was affected. The bridge now keeps one copy per attempt
+  and adds a `[bridge]` note: the download continues without the account, public
+  videos are unaffected, and what to check if the video needs the account. If the
+  job then fails — typically `Sign in to confirm your age` — the same note is
+  appended to the error details.
+
 ## [1.7.3] — 2026-09-22
 
 Clears the entire "Known issues" list carried into 1.7.2. These were design

@@ -502,6 +502,38 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(current["max_attempts"], 2)
         self.assertIn("simulated permanent download failure", current["error"])
 
+    def run_job_to_end(self, request: dict) -> dict:
+        jobs = bridge.JobManager(self.runner)
+        self.addCleanup(jobs.stop)
+        created = jobs.enqueue(request)
+        deadline = time.monotonic() + 4
+        current = created
+        while time.monotonic() < deadline:
+            current = jobs.get_job(created["id"])
+            if current["status"] in bridge.TERMINAL_STATUSES:
+                break
+            time.sleep(0.02)
+        return current
+
+    def test_rejected_cookies_warning_is_logged_once_with_an_explanation(self) -> None:
+        request = base_job()
+        request["selection"]["video_format_id"] = "cookiesrotated"
+        current = self.run_job_to_end(request)
+        self.assertEqual(current["status"], "completed", current)
+        warnings = [line for line in current["logs"] if "cookies are no longer valid" in line]
+        self.assertEqual(len(warnings), 1, current["logs"])
+        self.assertEqual(current["logs"].count(f"[bridge] {bridge.COOKIES_REJECTED_HINT}"), 1)
+        self.assertIsNone(current["error"])
+
+    def test_sign_in_error_after_rejected_cookies_carries_the_explanation(self) -> None:
+        request = base_job()
+        request["selection"]["video_format_id"] = "cookiesrotated-signin"
+        request["retry_count"] = 0
+        current = self.run_job_to_end(request)
+        self.assertEqual(current["status"], "failed", current)
+        self.assertTrue(current["error"].startswith("ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age."))
+        self.assertIn(bridge.COOKIES_REJECTED_HINT, current["error"])
+
     def test_job_can_be_cancelled_during_retry_backoff(self) -> None:
         request = base_job()
         request["selection"]["video_format_id"] = "alwaysfail"
