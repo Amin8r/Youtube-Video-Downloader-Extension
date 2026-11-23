@@ -26,7 +26,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '1.7.3';
+  const VERSION = '1.7.4';
   const BOOTSTRAP_TOKEN = '__VM_YTDLP_TOKEN__';
   const BOOTSTRAP_API_BASE = '__VM_YTDLP_API_BASE__';
   const STORAGE_KEY = 'vmYtDlp.settings.v1';
