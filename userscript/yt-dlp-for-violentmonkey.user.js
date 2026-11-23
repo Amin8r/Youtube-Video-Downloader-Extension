@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         yt-dlp for Violentmonkey
 // @namespace    local.vm-yt-dlp
-// @version      1.7.3
+// @version      1.7.4
 // @description  A secure, native-feeling YouTube download panel powered by your local yt-dlp.
 // @license      MIT
 // @match        https://www.youtube.com/*
