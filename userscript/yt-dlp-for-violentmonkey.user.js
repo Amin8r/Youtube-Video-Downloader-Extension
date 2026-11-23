@@ -33,7 +33,7 @@
   const ACTIVE_STATUSES = new Set(['queued', 'starting', 'downloading', 'postprocessing']);
   const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
   const RESUMABLE_STATUSES = new Set(['interrupted', 'failed', 'cancelled']);
-  const VIDEO_PATH_RE = /^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{6,32})/;
+  const VIDEO_PATH_RE = /^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{6,32})(?:\/|$)/;
 
   const ICONS = {
     download: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>',
@@ -107,12 +107,17 @@
     info: null,
     infoUrl: '',
     infoRequestUrl: '',
+    infoRequestId: 0,
     infoLoading: false,
     infoError: null,
     jobs: [],
     revision: -1,
     expandedJobDetails: new Set(),
     proxyHidden: false,
+    settingsDraft: null,
+    healthChecking: false,
+    pollPending: false,
+    pollEpoch: 0,
     form: {
       downloadMode: 'merge',
       selectionType: 'preset',
@@ -183,9 +188,18 @@
   }
 
   function validApiBase(value) {
+    if (typeof value !== 'string' || !value) return false;
     try {
       const url = new URL(value);
-      return url.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(url.hostname) && Boolean(url.port);
+      const hasExplicitPort = Boolean(url.port) || /:80(?:\/)?$/.test(value);
+      return url.protocol === 'http:'
+        && ['127.0.0.1', 'localhost'].includes(url.hostname)
+        && hasExplicitPort
+        && !url.username
+        && !url.password
+        && !url.search
+        && !url.hash
+        && (url.pathname === '' || url.pathname === '/');
     } catch (_) {
       return false;
     }
@@ -195,7 +209,7 @@
     if (typeof value !== 'string' || !value || value.length > 2048 || /[\u0000-\u0020\u007f]/.test(value)) return false;
     try {
       const url = new URL(value);
-      return ['http:', 'https:', 'socks4:', 'socks4a:', 'socks5:'].includes(url.protocol)
+      return ['http:', 'https:', 'socks4:', 'socks4a:', 'socks5:', 'socks5h:'].includes(url.protocol)
         && Boolean(url.hostname)
         && !url.search
         && !url.hash
@@ -262,23 +276,28 @@
     }
   }
 
-  function apiRequest(method, path, body = undefined, timeout = 180000) {
+  function apiRequest(method, path, body = undefined, timeout = 180000, settingsOverride = null) {
+    const activeSettings = settingsOverride || state.settings;
     return new Promise((resolve, reject) => {
-      if (!state.settings.token) {
+      if (!activeSettings.token) {
         reject(new ApiError('Pairing token is missing. Open Settings and paste the token printed by the installer.', 'token_missing', 401));
         return;
       }
-      if (!validApiBase(state.settings.apiBase)) {
+      if (!validApiBase(activeSettings.apiBase)) {
         reject(new ApiError('The service address must use http://127.0.0.1:PORT or http://localhost:PORT.', 'invalid_api_base'));
         return;
       }
+      const headers = {
+        Authorization: `Bearer ${state.settings.token}`,
+        Accept: 'application/json',
+      };
+      if (settingsOverride) {
+        headers.Authorization = `Bearer ${settingsOverride.token}`;
+      }
       const request = {
         method,
-        url: `${state.settings.apiBase.replace(/\/$/, '')}${path}`,
-        headers: {
-          Authorization: `Bearer ${state.settings.token}`,
-          Accept: 'application/json',
-        },
+        url: `${activeSettings.apiBase.replace(/\/$/, '')}${path}`,
+        headers,
         timeout,
         onload(response) {
           let parsed = {};
@@ -352,8 +371,10 @@
   }
 
   function formatDuration(seconds) {
-    const number = Math.max(0, Math.round(Number(seconds)));
-    if (!Number.isFinite(number)) return '—';
+    if (seconds == null || seconds === '') return '—';
+    const raw = Number(seconds);
+    if (!Number.isFinite(raw)) return '—';
+    const number = Math.max(0, Math.round(raw));
     const hours = Math.floor(number / 3600);
     const minutes = Math.floor((number % 3600) / 60);
     const secs = number % 60;
@@ -484,10 +505,25 @@
   }
 
   function findPlayerRightControls() {
+    const isVisibleControls = (controls) => {
+      if (!controls) return false;
+      if (typeof controls.getBoundingClientRect !== 'function') return true;
+      const rect = controls.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      if (typeof getComputedStyle === 'function') {
+        let node = controls;
+        while (node && node.nodeType === 1) {
+          const style = getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          node = node.parentElement;
+        }
+      }
+      return true;
+    };
     const primary = document.querySelector('#movie_player .ytp-right-controls');
-    if (primary) return primary;
+    if (isVisibleControls(primary)) return primary;
     return Array.from(document.querySelectorAll('.html5-video-player .ytp-right-controls'))
-      .find((controls) => !controls.closest('ytd-miniplayer')) || null;
+      .find((controls) => !controls.closest('ytd-miniplayer') && isVisibleControls(controls)) || null;
   }
 
   function findDirectPlayerControlAnchor(controls) {
@@ -804,10 +840,10 @@
         .vm-primary:active { transform: scale(.985); }
         .vm-primary:disabled { opacity: .45; cursor: wait; transform: none; }
         .vm-primary svg { width: 19px; height: 19px; }
-        .vm-secondary { height: 38px; padding: 0 13px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid var(--line); border-radius: 11px; color: #c3c4ca; background: rgba(255,255,255,.04); cursor: pointer; font-size: 11px; font-weight: 680; transition: .16s ease; }
+        .vm-secondary { height: 38px; padding: 0 13px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid var(--line); border-radius: 11px; color: #c3c4ca; background: rgba(255,255,255,.04); cursor: pointer; font-size: 11px; font-weight: 680; white-space: nowrap; transition: .16s ease; }
         .vm-secondary:hover { color: #fff; background: rgba(255,255,255,.075); }
         .vm-secondary.danger:hover { color: #ff8297; border-color: rgba(255,49,85,.25); background: rgba(255,49,85,.08); }
-        .vm-secondary svg { width: 15px; height: 15px; }
+        .vm-secondary svg { width: 15px; height: 15px; flex: 0 0 15px; }
         .vm-helper { display: flex; align-items: flex-start; gap: 8px; margin-top: 11px; padding: 10px 11px; border: 1px solid rgba(101,169,255,.12); border-radius: 12px; color: #878b96; background: rgba(101,169,255,.045); font-size: 9.8px; }
         .vm-helper svg { width: 15px; height: 15px; flex: 0 0 15px; color: var(--blue); }
         .vm-helper.warning { border-color: rgba(255,189,74,.2); color: #aaa18f; background: rgba(255,189,74,.06); }
@@ -824,9 +860,13 @@
         .vm-skeleton.hero { height: 188px; border-radius: 17px; }
         .vm-skeleton.line { height: 12px; margin-top: 11px; border-radius: 6px; }
         .vm-skeleton.line.short { width: 62%; }
-        .vm-queue-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+        .vm-queue-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 12px; margin-bottom: 12px; }
+        .vm-queue-summary { min-width: 0; flex: 1 1 170px; }
         .vm-queue-summary strong { display: block; color: #e6e6e9; font-size: 13px; }
-        .vm-queue-summary span { color: var(--muted); font-size: 10px; }
+        .vm-queue-summary span { display: block; color: var(--muted); font-size: 10px; }
+        .vm-queue-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+        .vm-queue-actions .vm-secondary { height: 32px; padding: 0 11px; border-radius: 10px; font-size: 10.5px; }
+        .vm-queue-actions .vm-secondary svg { width: 14px; height: 14px; flex: 0 0 14px; }
         .vm-job { overflow: hidden; margin-bottom: 10px; padding: 12px; }
         .vm-job:last-child { margin-bottom: 0; }
         .vm-job-top { display: flex; gap: 10px; }
@@ -980,7 +1020,9 @@
 
   function syncHomepageLauncherVisibility(fullscreen = isFullscreenActive()) {
     if (!homeLauncher) return;
-    const visible = isYouTubeHomepage() && !fullscreen && !state.open;
+    const hasVisiblePlayerButton = Boolean(playerButton?.isConnected && !playerButton.hidden);
+    const visible = (isYouTubeHomepage() && !fullscreen && !state.open)
+      || (Boolean(currentVideoUrl()) && !hasVisiblePlayerButton && !fullscreen && !state.open);
     homeLauncher.classList.toggle('visible', visible);
     homeLauncher.tabIndex = visible ? 0 : -1;
     homeLauncher.setAttribute('aria-hidden', String(!visible));
@@ -994,6 +1036,7 @@
     const tab = target.dataset.tab;
     if (tab) {
       const changed = state.tab !== tab;
+      if (changed && state.tab === 'settings') state.settingsDraft = null;
       state.tab = tab;
       updateChrome();
       renderCurrentTab(changed);
@@ -1043,6 +1086,7 @@
 
   function closePanel() {
     state.open = false;
+    state.settingsDraft = null;
     shell.classList.remove('open');
     playerButton?.setAttribute('aria-expanded', 'false');
     syncHomepageLauncherVisibility();
@@ -1067,7 +1111,7 @@
         ? 'Local service unavailable'
         : 'Checking local service…';
     const activeCount = state.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)).length;
-    const resumableCount = state.jobs.filter((job) => job.resumable === true || RESUMABLE_STATUSES.has(job.status)).length;
+    const resumableCount = state.jobs.filter(isJobResumable).length;
     const attentionCount = activeCount + resumableCount;
     queueBadge.hidden = attentionCount === 0;
     queueBadge.textContent = String(attentionCount);
@@ -1102,35 +1146,51 @@
     if (animate) animateContentChange();
   }
 
-  async function testConnection(showResult = false) {
-    if (!state.settings.token) {
-      state.connection = 'offline';
-      state.health = null;
-      updateChrome();
+  async function testConnection(showResult = false, settingsOverride = null) {
+    const activeSettings = settingsOverride || state.settings;
+    const isDraftTest = Boolean(settingsOverride);
+    if (!activeSettings.token) {
+      if (!isDraftTest) {
+        state.connection = 'offline';
+        state.health = null;
+        updateChrome();
+      }
       if (showResult) toast('Pairing token is missing.', true);
       return false;
     }
-    state.connection = 'checking';
-    updateChrome();
+    if (!isDraftTest) {
+      state.healthChecking = true;
+      state.connection = 'checking';
+      updateChrome();
+    }
     try {
-      const health = await apiRequest('GET', '/api/v1/health', undefined, 10000);
-      state.health = health;
-      state.connection = health.status === 'ready' ? 'ready' : 'offline';
+      const health = await apiRequest('GET', '/api/v1/health', undefined, 10000, activeSettings);
+      if (!isDraftTest) {
+        state.health = health;
+        state.connection = health.status === 'ready' ? 'ready' : 'offline';
+        updateChrome();
+      }
       if (showResult) toast(`Connected to yt-dlp ${health.yt_dlp_version}.`);
-      updateChrome();
-      return state.connection === 'ready';
+      return health.status === 'ready';
     } catch (error) {
-      state.connection = 'offline';
-      state.health = null;
-      updateChrome();
+      if (!isDraftTest) {
+        state.connection = 'offline';
+        state.health = null;
+        updateChrome();
+      }
       if (showResult) toast(error.message, true);
       return false;
+    } finally {
+      if (!isDraftTest) state.healthChecking = false;
     }
   }
 
   async function fetchInfo(force = false) {
     const url = currentVideoUrl();
     if (!url) {
+      state.infoRequestId = (state.infoRequestId || 0) + 1;
+      state.infoRequestUrl = '';
+      state.infoLoading = false;
       state.info = null;
       state.infoUrl = '';
       state.infoError = null;
@@ -1142,9 +1202,11 @@
     // the in-flight request is for the previous video: mark it stale so its
     // response is discarded, and start a fresh request for the page we are on.
     // Without this, the panel kept showing the old video and queued it instead.
-    if (state.infoLoading && state.infoRequestUrl === url) return;
+    if (!force && state.infoLoading && state.infoRequestUrl === url) return;
     const previousInfoUrl = state.infoUrl;
     const requestUrl = url;
+    const requestId = (state.infoRequestId || 0) + 1;
+    state.infoRequestId = requestId;
     state.infoRequestUrl = requestUrl;
     state.infoLoading = true;
     state.infoError = null;
@@ -1157,7 +1219,7 @@
         proxy_url: proxyPayload(),
         allow_invalid_certificates: state.settings.allowInvalidCertificates === true,
       });
-      if (state.infoRequestUrl !== requestUrl || currentVideoUrl() !== requestUrl) return;
+      if (state.infoRequestId !== requestId || state.infoRequestUrl !== requestUrl || currentVideoUrl() !== requestUrl) return;
       if (previousInfoUrl !== requestUrl) {
         state.form.exactFormatId = '';
         state.form.mergeVideoFormatId = '';
@@ -1168,13 +1230,13 @@
       state.connection = 'ready';
       ensureExactFormat();
     } catch (error) {
-      if (state.infoRequestUrl !== requestUrl) return;
+      if (state.infoRequestId !== requestId || state.infoRequestUrl !== requestUrl) return;
       state.info = null;
       state.infoUrl = '';
       state.infoError = error;
       if (error.code === 'connection_failed' || error.status === 401) state.connection = 'offline';
     } finally {
-      if (state.infoRequestUrl === requestUrl) {
+      if (state.infoRequestId === requestId && state.infoRequestUrl === requestUrl) {
         state.infoLoading = false;
         updateChrome();
         if (state.tab === 'download') renderDownload();
@@ -1245,11 +1307,13 @@
     }
     formats.sort((a, b) => {
       if (mediaType === 'video') {
-        return (Number(b.height) - Number(a.height)) || (Number(b.fps) - Number(a.fps)) || (Number(b.tbr) - Number(a.tbr));
+        return ((Number(b.height) || 0) - (Number(a.height) || 0))
+          || ((Number(b.fps) || 0) - (Number(a.fps) || 0))
+          || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
       }
       return (audioPreferenceScore(b) - audioPreferenceScore(a))
-        || (Number(b.abr) - Number(a.abr))
-        || (Number(b.tbr) - Number(a.tbr));
+        || ((Number(b.abr) || 0) - (Number(a.abr) || 0))
+        || ((Number(b.tbr) || 0) - (Number(a.tbr) || 0));
     });
     return formats;
   }
@@ -1410,7 +1474,7 @@
               </label>` : `
               <label class="vm-field full">
                 <span class="vm-label">Exact stream <span>${formats.length} available</span></span>
-                <select class="vm-select" data-field="exactFormatId">${exactOptions}</select>
+                <select class="vm-select" data-field="exactFormatId" ${formats.length ? '' : 'disabled'}>${exactOptions || '<option value="">No video-only stream available</option>'}</select>
                 ${formatMeta(selectedFormat)}
               </label>`}`}`}
 
@@ -1560,7 +1624,8 @@
   async function enqueueCurrent() {
     const button = content.querySelector('[data-action="enqueue"]');
     const isMergeMode = state.form.downloadMode === 'merge';
-    const format = isMergeMode ? null : sortedFormats().find((item) => item.format_id === state.form.exactFormatId);
+    const usesExactFormat = !isMergeMode && (state.form.downloadMode === 'audio' || state.form.selectionType === 'exact');
+    const format = usesExactFormat ? sortedFormats().find((item) => item.format_id === state.form.exactFormatId) : null;
     const mergeVideoFormat = isMergeMode
       ? sortedFormats('video').find((item) => item.format_id === state.form.mergeVideoFormatId)
       : null;
@@ -1615,7 +1680,7 @@
         subtitle_mode: state.form.subtitleMode,
         subtitle_languages: state.form.subtitleLanguages,
         subtitle_format: state.form.subtitleFormat,
-        embed_subtitles: state.form.embedSubtitles,
+        embed_subtitles: state.form.downloadMode !== 'audio' && state.form.subtitleMode !== 'none' && Boolean(state.form.embedSubtitles),
         write_thumbnail: state.form.writeThumbnail,
         embed_thumbnail: state.form.embedThumbnail,
         thumbnail_format: state.form.thumbnailFormat,
@@ -1627,7 +1692,8 @@
     try {
       await requireDownloadCapabilities();
       const response = await apiRequest('POST', '/api/v1/jobs', payload);
-      state.jobs.unshift(response.job);
+      state.pollEpoch = (state.pollEpoch || 0) + 1;
+      state.jobs = [response.job, ...state.jobs.filter((item) => item.id !== response.job.id)];
       state.connection = 'ready';
       updateChrome();
       toast(`Queued “${response.job.title}”.`);
@@ -1648,6 +1714,10 @@
     }
   }
 
+  function isJobResumable(job) {
+    return job.resumable === true || RESUMABLE_STATUSES.has(job.status);
+  }
+
   function jobViewModel(job) {
     const progress = job.progress || {};
     const percent = job.status === 'completed' ? 100 : Math.max(0, Math.min(100, Number(progress.percent) || 0));
@@ -1663,7 +1733,7 @@
       detailText: job.error || logs,
       detailLabel: job.error ? 'Error details' : 'yt-dlp log',
       canPause: ACTIVE_STATUSES.has(job.status),
-      canResume: job.resumable === true || RESUMABLE_STATUSES.has(job.status),
+      canResume: isJobResumable(job),
       attemptText: maxAttempts > 1 && attempt > 0 ? `Attempt ${attempt}/${maxAttempts}` : '',
       modeText: {
         video: 'Video only',
@@ -1687,7 +1757,7 @@
   function queueViewModel() {
     const active = state.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)).length;
     const completed = state.jobs.filter((job) => job.status === 'completed').length;
-    const resumable = state.jobs.filter((job) => job.resumable === true || RESUMABLE_STATUSES.has(job.status)).length;
+    const resumable = state.jobs.filter(isJobResumable).length;
     return {
       title: active ? `${active} active download${active === 1 ? '' : 's'}` : resumable ? `${resumable} ready to resume` : 'Queue is idle',
       meta: `${completed} completed · ${resumable} resumable · ${state.jobs.length} total`,
@@ -1825,6 +1895,8 @@
   function updateQueueView() {
     const queueView = content?.querySelector('.vm-queue-view');
     if (!queueView || !state.jobs.length) return false;
+    const hasClearAllButton = Boolean(queueView.querySelector('[data-action="clear-all-jobs"]'));
+    if (hasClearAllButton !== state.jobs.some(isJobResumable)) return false;
     const cards = Array.from(queueView.querySelectorAll('[data-job-id]'));
     if (cards.length !== state.jobs.length) return false;
     if (cards.some((card, index) => card.dataset.jobId !== state.jobs[index].id)) return false;
@@ -1877,8 +1949,10 @@
       <div class="vm-queue-view">
         <div class="vm-queue-head">
           <div class="vm-queue-summary"><strong data-queue-title>${h(queue.title)}</strong><span data-queue-meta>${h(queue.meta)}</span></div>
-          <button class="vm-secondary danger" type="button" data-action="clear-jobs">${ICONS.trash} Clear completed</button>
-          ${state.jobs.some((job) => RESUMABLE_STATUSES.has(job.status)) ? `<button class="vm-secondary danger" type="button" data-action="clear-all-jobs" title="Forget every paused, failed and recovered entry; partial files stay on disk">${ICONS.trash} Forget all unfinished</button>` : ''}
+          <div class="vm-queue-actions">
+            <button class="vm-secondary danger" type="button" data-action="clear-jobs">${ICONS.trash} Clear completed</button>
+            ${state.jobs.some(isJobResumable) ? `<button class="vm-secondary danger" type="button" data-action="clear-all-jobs" title="Forget every paused, failed and recovered entry; partial files stay on disk">${ICONS.trash} Forget all unfinished</button>` : ''}
+          </div>
         </div>
         <div>${state.jobs.map(renderJob).join('')}</div>
         <div class="vm-footer">Paused and recovered downloads stay resumable until you choose Resume. The queue runs sequentially to reduce YouTube rate-limit pressure.</div>
@@ -1909,14 +1983,26 @@
   }
 
   async function pollJobs(forceRender = false) {
-    if (state.polling || !state.settings.token) return;
+    if (!state.settings.token) return;
+    if (state.polling) {
+      state.pollPending = true;
+      return;
+    }
     state.polling = true;
+    const pollEpoch = state.pollEpoch || 0;
     try {
       const previous = new Map(state.jobs.map((job) => [job.id, job.status]));
       const response = await apiRequest('GET', '/api/v1/jobs', undefined, 12000);
+      if ((state.pollEpoch || 0) !== pollEpoch) {
+        state.pollPending = true;
+        return;
+      }
       state.jobs = response.jobs || [];
       state.revision = response.revision ?? state.revision;
       state.connection = 'ready';
+      if (!state.health && !state.healthChecking && typeof testConnection === 'function') {
+        void testConnection(false);
+      }
       // Drop notification keys for jobs the bridge no longer reports, otherwise
       // this Set grows for the whole lifetime of the tab.
       if (state.notified.size > 200) {
@@ -1926,6 +2012,10 @@
         }
       }
       for (const job of state.jobs) {
+        if (ACTIVE_STATUSES.has(job.status)) {
+          for (const status of TERMINAL_STATUSES) state.notified.delete(`${job.id}:${status}`);
+          continue;
+        }
         const oldStatus = previous.get(job.id);
         if (oldStatus && !TERMINAL_STATUSES.has(oldStatus) && TERMINAL_STATUSES.has(job.status) && !state.notified.has(`${job.id}:${job.status}`)) {
           state.notified.add(`${job.id}:${job.status}`);
@@ -1935,7 +2025,7 @@
         }
       }
       updateChrome();
-      if ((forceRender || state.tab === 'queue') && state.open && !updateQueueView()) renderQueue();
+      if (state.tab === 'queue' && state.open && !updateQueueView()) renderQueue();
     } catch (error) {
       if (error.code === 'connection_failed' || error.status === 401) {
         state.connection = 'offline';
@@ -1944,6 +2034,10 @@
       if (forceRender) toast(error.message, true);
     } finally {
       state.polling = false;
+      if (state.pollPending) {
+        state.pollPending = false;
+        void pollJobs(false);
+      }
     }
   }
 
@@ -1963,6 +2057,7 @@
   async function cancelJob(jobId) {
     try {
       await apiRequest('POST', `/api/v1/jobs/${encodeURIComponent(jobId)}/cancel`, {});
+      state.pollEpoch = (state.pollEpoch || 0) + 1;
       toast('Pausing download…');
       await pollJobs(true);
     } catch (error) {
@@ -1978,6 +2073,7 @@
         proxy_url: proxyPayload(),
         allow_invalid_certificates: state.settings.allowInvalidCertificates === true,
       });
+      state.pollEpoch = (state.pollEpoch || 0) + 1;
       toast(`Resuming “${response.job.title}”.`);
       await pollJobs(true);
     } catch (error) {
@@ -1989,6 +2085,7 @@
     if (!window.confirm('Forget this recovery record? Partial files will stay on disk, but the extension will no longer be able to resume them automatically.')) return;
     try {
       await apiRequest('POST', `/api/v1/jobs/${encodeURIComponent(jobId)}/forget`, {});
+      state.pollEpoch = (state.pollEpoch || 0) + 1;
       toast('Recovery record removed. Partial files were left on disk.');
       await pollJobs(true);
     } catch (error) {
@@ -2000,6 +2097,7 @@
     if (includeUnfinished && !window.confirm('Forget every paused, failed and recovered entry? Partial files stay on disk, but they can no longer be resumed from this panel.')) return;
     try {
       const response = await apiRequest('POST', '/api/v1/jobs/clear', { include_unfinished: includeUnfinished === true });
+      state.pollEpoch = (state.pollEpoch || 0) + 1;
       const noun = includeUnfinished ? 'job' : 'completed job';
       toast(`Cleared ${response.cleared} ${noun}${response.cleared === 1 ? '' : 's'}.`);
       await pollJobs(true);
@@ -2020,7 +2118,8 @@
   }
 
   function renderSettings() {
-    const s = state.settings;
+    const s = state.settingsDraft || state.settings;
+    const tokenInput = state.settingsDraft?.tokenInput || '';
     replaceMarkup(content, `
       <section class="vm-settings-group vm-card">
         <h3 class="vm-settings-title">${ICONS.shield} Local pairing</h3>
@@ -2031,7 +2130,7 @@
         </label>
         <label class="vm-field vm-setting-row">
           <span class="vm-label">Replace pairing token <span>${s.token ? 'paired' : 'not paired'}</span></span>
-          <input class="vm-input" data-setting="token" value="" type="password" autocomplete="new-password" placeholder="Paste a new token only when needed">
+          <input class="vm-input" data-setting="token" value="${h(tokenInput)}" type="password" autocomplete="new-password" placeholder="Paste a new token only when needed">
         </label>
         ${state.health?.download_dir ? `<div class="vm-path">Downloads: ${h(state.health.download_dir)}</div>` : ''}
       </section>
@@ -2110,13 +2209,23 @@
     bindSettingsHandlers();
   }
 
-  function collectSettings() {
-    const next = { ...state.settings };
+  function readSettingsDraft() {
+    const draft = { ...(state.settingsDraft || state.settings), tokenInput: state.settingsDraft?.tokenInput || '' };
     content.querySelectorAll('[data-setting]').forEach((input) => {
       const key = input.dataset.setting;
-      if (key === 'token' && !input.value.trim()) return;
-      next[key] = input.type === 'checkbox' ? input.checked : input.value.trim();
+      if (key === 'token') {
+        draft.tokenInput = input.value.trim();
+        return;
+      }
+      draft[key] = input.type === 'checkbox' ? input.checked : input.value.trim();
     });
+    return draft;
+  }
+
+  function collectSettings() {
+    const draft = readSettingsDraft();
+    const { tokenInput, ...next } = draft;
+    if (tokenInput) next.token = tokenInput;
     if (!validApiBase(next.apiBase)) {
       throw new ApiError('Service address must use loopback HTTP and include a port.', 'invalid_api_base');
     }
@@ -2124,7 +2233,7 @@
       throw new ApiError('The pairing token is too short.', 'invalid_token');
     }
     if (next.proxyEnabled && !validProxyUrl(next.proxyUrl)) {
-      throw new ApiError('Proxy URL must use HTTP, HTTPS, SOCKS4, SOCKS4A, or SOCKS5 and contain a host.', 'invalid_proxy');
+      throw new ApiError('Proxy URL must use HTTP, HTTPS, SOCKS4, SOCKS4A, SOCKS5, or SOCKS5H and contain a host.', 'invalid_proxy');
     }
     return next;
   }
@@ -2147,35 +2256,31 @@
     });
     for (const key of ['cookieBrowser', 'cookieSource']) {
       content.querySelector(`[data-setting="${key}"]`)?.addEventListener('change', (event) => {
-        try {
-          state.settings = collectSettings();
-          state.settings[key] = event.target.value;
-          renderSettings();
-        } catch (error) {
-          toast(error.message, true);
-        }
+        state.settingsDraft = readSettingsDraft();
+        state.settingsDraft[key] = event.target.value;
+        renderSettings();
       });
     }
     content.querySelector('[data-action="save-settings"]')?.addEventListener('click', async () => {
       try {
         state.settings = collectSettings();
+        state.settingsDraft = null;
         saveSettings();
         state.info = null;
         state.infoUrl = '';
         toast('Settings saved.');
         await testConnection(false);
-        renderSettings();
+        if (state.tab === 'settings') renderSettings();
       } catch (error) {
         toast(error.message, true);
       }
     });
     content.querySelector('[data-action="test-settings"]')?.addEventListener('click', async () => {
       try {
-        const previous = state.settings;
-        state.settings = collectSettings();
-        const okay = await testConnection(true);
-        if (!okay) state.settings = previous;
-        renderSettings();
+        const candidate = collectSettings();
+        state.settingsDraft = readSettingsDraft();
+        await testConnection(true, candidate);
+        if (state.tab === 'settings') renderSettings();
       } catch (error) {
         toast(error.message, true);
       }
@@ -2225,13 +2330,14 @@
       if (location.href === state.lastUrl) return;
       state.lastUrl = location.href;
       const nextUrl = currentVideoUrl();
-      if (nextUrl !== state.infoUrl) {
+      if (nextUrl !== state.infoUrl || nextUrl !== state.infoRequestUrl) {
         state.info = null;
         state.infoUrl = '';
         state.infoError = null;
         // Any metadata request still in flight belongs to the page we just left.
         if (state.infoLoading && state.infoRequestUrl !== nextUrl) {
-          state.infoRequestUrl = nextUrl;
+          state.infoRequestId = (state.infoRequestId || 0) + 1;
+          state.infoRequestUrl = '';
           state.infoLoading = false;
         }
         if (state.open && state.tab === 'download') {

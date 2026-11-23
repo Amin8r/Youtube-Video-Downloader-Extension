@@ -27,21 +27,46 @@ good() { printf '%b✓%b %s\n' "${green}" "${reset}" "$*"; }
 warn() { printf '%b!%b %s\n' "${amber}" "${reset}" "$*"; }
 die() { printf '%bError:%b %s\n' "${red}${bold}" "${reset}" "$*" >&2; exit 1; }
 
+systemd_escape() {
+  local value="$1"
+  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] \
+    || die "A path or environment variable contains a newline and cannot be written to systemd."
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//%/%%}"
+  printf '%s' "${value}"
+}
+
+venv_is_usable() {
+  [[ -x "${VM_VENV_DIR}/bin/python" ]] || return 1
+  "${VM_VENV_DIR}/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1 || return 1
+  "${VM_VENV_DIR}/bin/python" -m pip --version >/dev/null 2>&1 || return 1
+}
+
 printf '\n%b  yt-dlp for Violentmonkey%b\n' "${bold}" "${reset}"
 printf '%b  Secure local bridge installer · Linux%b\n\n' "${muted}" "${reset}"
 
 command -v "${VM_PYTHON_BIN}" >/dev/null 2>&1 || die "Python 3 was not found. Install Python 3.10 or newer first."
 "${VM_PYTHON_BIN}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
   || die "Python 3.10 or newer is required."
-[[ -f "${VM_BRIDGE_FILE}" || -f "${SCRIPT_DIR}/companion/vm_ytdlp_bridge.py" ]] \
+[[ -f "${SCRIPT_DIR}/companion/vm_ytdlp_bridge.py" ]] \
   || die "The companion source is missing from this release."
 [[ -f "${VM_USER_SCRIPT_TEMPLATE}" ]] || die "The userscript template is missing from this release."
 
 info "Creating an isolated Python environment"
-mkdir -p "${VM_DATA_ROOT}" "${VM_CONFIG_ROOT}" "${VM_CACHE_ROOT}" "${VM_DENO_CACHE_ROOT}" "${HOME}/Downloads/YouTube"
-if [[ ! -x "${VM_VENV_DIR}/bin/python" ]]; then
-  "${VM_PYTHON_BIN}" -m venv "${VM_VENV_DIR}" \
-    || die "Could not create a virtual environment. On Debian/Ubuntu, install python3-venv."
+mkdir -p "${VM_DATA_ROOT}" "${VM_CACHE_ROOT}" "${VM_DENO_CACHE_ROOT}"
+mkdir -p -m 0700 "${VM_CONFIG_ROOT}"
+chmod 0700 "${VM_CONFIG_ROOT}" 2>/dev/null || true
+if [[ ! -f "${VM_CONFIG_FILE}" ]]; then
+  mkdir -p "${HOME}/Downloads/YouTube"
+fi
+
+if ! venv_is_usable; then
+  rm -rf "${VM_VENV_DIR}"
+  if ! "${VM_PYTHON_BIN}" -m venv "${VM_VENV_DIR}"; then
+    rm -rf "${VM_VENV_DIR}"
+    die "Could not create a virtual environment. On Debian/Ubuntu, install python3-venv."
+  fi
 fi
 "${VM_VENV_DIR}/bin/python" -m pip install --disable-pip-version-check --upgrade pip >/dev/null
 
@@ -63,28 +88,34 @@ chmod 0600 "${VM_CONFIG_FILE}" "${VM_USER_SCRIPT_OUTPUT}" 2>/dev/null || true
 
 info "Registering the per-user background service"
 mkdir -p "${VM_SERVICE_DIR}"
+ESC_VENV_PYTHON="$(systemd_escape "${VM_VENV_DIR}/bin/python")"
+ESC_BRIDGE_FILE="$(systemd_escape "${VM_BRIDGE_FILE}")"
+ESC_CONFIG_FILE="$(systemd_escape "${VM_CONFIG_FILE}")"
+ESC_PATH="$(systemd_escape "${VM_VENV_DIR}/bin:${PATH}")"
+ESC_DENO_DIR="$(systemd_escape "${VM_DENO_CACHE_ROOT}")"
 {
   printf '[Unit]\n'
   printf 'Description=yt-dlp for Violentmonkey localhost bridge\n'
   printf 'After=network-online.target\n\n'
   printf '[Service]\n'
   printf 'Type=simple\n'
-  printf 'ExecStart="%s" "%s" --config "%s" serve\n' "${VM_VENV_DIR}/bin/python" "${VM_BRIDGE_FILE}" "${VM_CONFIG_FILE}"
+  printf 'ExecStart="%s" "%s" --config "%s" serve\n' "${ESC_VENV_PYTHON}" "${ESC_BRIDGE_FILE}" "${ESC_CONFIG_FILE}"
   printf 'Restart=on-failure\n'
   printf 'RestartSec=3\n'
   printf 'NoNewPrivileges=true\n'
   printf 'PrivateTmp=true\n'
   printf 'UMask=0077\n'
-  printf 'Environment=PYTHONUNBUFFERED=1\n\n'
-  printf 'Environment="PATH=%s"\n\n' "${VM_VENV_DIR}/bin:${PATH}"
-  printf 'Environment="DENO_DIR=%s"\n\n' "${VM_DENO_CACHE_ROOT}"
+  printf 'Environment=PYTHONUNBUFFERED=1\n'
+  printf 'Environment="PATH=%s"\n' "${ESC_PATH}"
+  printf 'Environment="DENO_DIR=%s"\n\n' "${ESC_DENO_DIR}"
   printf '[Install]\n'
   printf 'WantedBy=default.target\n'
 } > "${VM_SERVICE_FILE}"
 
 if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
   systemctl --user daemon-reload
-  systemctl --user enable --now vm-yt-dlp.service
+  systemctl --user enable vm-yt-dlp.service
+  systemctl --user restart vm-yt-dlp.service
   good "Local bridge is running"
 else
   warn "No systemd user session was detected. Start the bridge manually with:"
@@ -97,10 +128,10 @@ else
   warn "ffmpeg is missing. Install it before downloading merged video or converted audio."
 fi
 
-if command -v deno >/dev/null 2>&1 || command -v node >/dev/null 2>&1 || command -v bun >/dev/null 2>&1; then
+if command -v deno >/dev/null 2>&1 || command -v node >/dev/null 2>&1 || command -v bun >/dev/null 2>&1 || command -v qjs >/dev/null 2>&1 || command -v quickjs >/dev/null 2>&1; then
   good "JavaScript runtime detected for full YouTube support"
 else
-  warn "Install Deno or Node.js for yt-dlp's full YouTube signature support."
+  warn "Install Deno, Node.js, Bun, or QuickJS for yt-dlp's full YouTube signature support."
 fi
 
 printf '\n%bInstallation complete.%b\n' "${green}${bold}" "${reset}"

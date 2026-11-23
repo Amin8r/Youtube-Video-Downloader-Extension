@@ -17,6 +17,7 @@ import datetime as dt
 import hmac
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import queue
@@ -127,6 +128,7 @@ FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{6,32}$")
 SUBTITLE_LANGS_RE = re.compile(r"^[A-Za-z0-9_.*?,+-]{1,240}$")
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9._~-]{32,256}$")
 
 
 def utc_now() -> str:
@@ -170,11 +172,15 @@ def clean_block(value: Any, limit: int = 500) -> str:
 def optional_number(value: Any) -> int | float | None:
     if isinstance(value, bool) or value is None:
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     try:
         number = float(str(value))
     except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
         return None
     return int(number) if number.is_integer() else number
 
@@ -227,9 +233,9 @@ class BridgeConfig:
             ) from exc
 
         token = str(raw.get("token", ""))
-        if len(token) < 32:
+        if not TOKEN_RE.fullmatch(token):
             raise BridgeError(
-                "The configured API token is missing or too short.",
+                "The configured API token is missing, too short, or contains invalid characters.",
                 code="config_invalid",
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
@@ -268,7 +274,7 @@ class BridgeConfig:
                 code="config_invalid",
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
-        cookies_file = pathlib.Path(cookies_raw).expanduser() if cookies_raw and cookies_raw.strip() else None
+        cookies_file = pathlib.Path(cookies_raw.strip()).expanduser() if cookies_raw and cookies_raw.strip() else None
 
         return cls(
             token=token,
@@ -301,12 +307,20 @@ class BridgeConfig:
             "concurrent_fragments": 4,
         }
         temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
-        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.chmod(temporary, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, indent=2) + "\n")
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            os.chmod(path, 0o600)
         except OSError:
             pass
-        os.replace(temporary, path)
         return path
 
 
@@ -360,7 +374,7 @@ def validate_proxy_url(raw: Any) -> str | None:
     except ValueError as exc:
         raise BridgeError("Proxy URL could not be parsed.", code="invalid_proxy") from exc
     if parsed.scheme.lower() not in PROXY_SCHEMES:
-        raise BridgeError("Proxy URL must use HTTP, HTTPS, SOCKS4, SOCKS4A, or SOCKS5.", code="invalid_proxy")
+        raise BridgeError("Proxy URL must use HTTP, HTTPS, SOCKS4, SOCKS4A, SOCKS5, or SOCKS5H.", code="invalid_proxy")
     if not hostname:
         raise BridgeError("Proxy URL must contain a host.", code="invalid_proxy")
     if port is not None and not (1 <= port <= 65535):
@@ -387,19 +401,32 @@ def redact_proxy_reference(value: Any, proxy_url: str | None) -> str:
     except ValueError:
         parsed = None
 
-    needles = {proxy_url, proxy_url.rstrip("/")}
+    needles = {proxy_url, proxy_url.rstrip("/"), urllib.parse.unquote(proxy_url), urllib.parse.unquote(proxy_url).rstrip("/")}
+    secrets_to_redact: set[str] = set()
     if parsed is not None and parsed.netloc:
         needles.add(parsed.netloc)
-        if parsed.username:
-            credentials = parsed.username
-            if parsed.password:
-                credentials += f":{parsed.password}"
-            needles.add(credentials)
-            needles.add(f"{credentials}@")
+        needles.add(urllib.parse.unquote(parsed.netloc))
+        raw_user = parsed.username or ""
+        raw_pass = parsed.password or ""
+        dec_user = urllib.parse.unquote(raw_user)
+        dec_pass = urllib.parse.unquote(raw_pass)
+        for user, password in ((raw_user, raw_pass), (dec_user, dec_pass)):
+            if user and password:
+                creds = f"{user}:{password}"
+                needles.add(creds)
+                needles.add(f"{creds}@")
+            elif user:
+                needles.add(f"{user}@")
+            elif password:
+                needles.add(f":{password}@")
+        if raw_pass:
+            secrets_to_redact.add(raw_pass)
+        if dec_pass:
+            secrets_to_redact.add(dec_pass)
     for needle in sorted((n for n in needles if n), key=len, reverse=True):
         text = re.sub(re.escape(needle), "[configured proxy]", text, flags=re.IGNORECASE)
-    if parsed is not None and parsed.password:
-        text = re.sub(re.escape(parsed.password), "[redacted]", text, flags=re.IGNORECASE)
+    for secret in sorted((s for s in secrets_to_redact if s), key=len, reverse=True):
+        text = re.sub(re.escape(secret), "[redacted]", text, flags=re.IGNORECASE)
     return text
 
 
@@ -620,9 +647,7 @@ def validate_job_payload(raw: Any) -> dict[str, Any]:
     expected_bytes = validate_expected_bytes(raw.get("expected_bytes"), download_mode, selection)
 
     title_hint = clean_text(raw.get("title_hint", "YouTube video"), 240) or "YouTube video"
-    thumbnail_hint = str(raw.get("thumbnail_hint", ""))[:2048]
-    if thumbnail_hint and not thumbnail_hint.startswith(("https://i.ytimg.com/", "https://img.youtube.com/")):
-        thumbnail_hint = ""
+    thumbnail_hint = sanitize_thumbnail_url(raw.get("thumbnail_hint", ""))
 
     return {
         "url": url,
@@ -664,6 +689,28 @@ def validate_resume_payload(raw: Any) -> dict[str, Any]:
         "proxy_url": validate_proxy_url(raw.get("proxy_url")),
         "allow_invalid_certificates": validate_bool(raw, "allow_invalid_certificates"),
     }
+
+
+def sanitize_thumbnail_url(value: Any) -> str:
+    thumbnail = str(value or "").strip()
+    if not thumbnail or len(thumbnail) > 2048:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(thumbnail)
+        host = (parts.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    if parts.scheme != "https" or parts.username or parts.password:
+        return ""
+    if (
+        host == "ytimg.com"
+        or host.endswith(".ytimg.com")
+        or host == "ggpht.com"
+        or host.endswith(".ggpht.com")
+        or host == "img.youtube.com"
+    ):
+        return thumbnail
+    return ""
 
 
 def bool_codec(value: Any) -> str:
@@ -728,20 +775,7 @@ def sanitize_info(raw: Mapping[str, Any]) -> dict[str, Any]:
             result[language] = extensions
         return result
 
-    thumbnail = str(raw.get("thumbnail") or "")
-    try:
-        thumbnail_parts = urllib.parse.urlsplit(thumbnail)
-        thumbnail_host = (thumbnail_parts.hostname or "").lower()
-    except ValueError:
-        thumbnail_parts = urllib.parse.SplitResult("", "", "", "", "")
-        thumbnail_host = ""
-    if thumbnail_parts.scheme != "https" or not (
-        thumbnail_host == "ytimg.com"
-        or thumbnail_host.endswith(".ytimg.com")
-        or thumbnail_host == "ggpht.com"
-        or thumbnail_host.endswith(".ggpht.com")
-    ):
-        thumbnail = ""
+    thumbnail = sanitize_thumbnail_url(raw.get("thumbnail"))
     return {
         "id": clean_text(raw.get("id"), 40),
         "title": clean_text(raw.get("title"), 500),
@@ -983,7 +1017,13 @@ class YtDlpRunner:
 
     def javascript_runtime_args(self) -> list[str]:
         runtime = self.javascript_runtime()
-        return ["--js-runtimes", runtime] if runtime else []
+        if not runtime:
+            return []
+        if runtime == "quickjs" and shutil.which("qjs") is None:
+            quickjs_path = shutil.which("quickjs")
+            if quickjs_path:
+                return ["--js-runtimes", f"quickjs:{quickjs_path}"]
+        return ["--js-runtimes", runtime]
 
     def version(self) -> str:
         with self._version_lock:
@@ -999,10 +1039,13 @@ class YtDlpRunner:
                     timeout=15,
                     check=False,
                 )
-                self._cached_version = clean_text(result.stdout or result.stderr, 120) if result.returncode == 0 else "unavailable"
+                detected = clean_text(result.stdout or result.stderr, 120) if result.returncode == 0 else ""
+                if detected:
+                    self._cached_version = detected
+                    return self._cached_version
             except (OSError, subprocess.SubprocessError):
-                self._cached_version = "unavailable"
-            return self._cached_version
+                pass
+            return "unavailable"
 
     def extract_info(
         self,
@@ -1172,7 +1215,31 @@ class YtDlpRunner:
                 code="metadata_timeout",
                 status=HTTPStatus.GATEWAY_TIMEOUT,
             )
-        return int(process.returncode or 0), "".join(chunks), "\n".join(stderr_tail)
+        if process.returncode is None:
+            raise BridgeError(
+                "yt-dlp did not exit cleanly while reading this video's formats.",
+                code="metadata_failed",
+                status=HTTPStatus.BAD_GATEWAY,
+            )
+        return int(process.returncode), "".join(chunks), "\n".join(stderr_tail)
+
+    @staticmethod
+    def _kill_windows_tree(process: subprocess.Popen[str]) -> None:
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except (OSError, ProcessLookupError):
+                pass
 
     @staticmethod
     def _terminate_metadata_process(process: subprocess.Popen[str]) -> None:
@@ -1180,7 +1247,7 @@ class YtDlpRunner:
             return
         try:
             if os.name == "nt":
-                process.terminate()
+                YtDlpRunner._kill_windows_tree(process)
             else:
                 os.killpg(process.pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
@@ -1247,7 +1314,7 @@ class YtDlpRunner:
                 + PROGRESS_PREFIX
                 + "%(progress.downloaded_bytes)s|%(progress.total_bytes)s|"
                 + "%(progress.total_bytes_estimate)s|%(progress.speed)s|"
-                + "%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s"
+                + "%(progress.eta)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(info.format_id)s"
             ),
             "--print",
             f"after_move:{OUTPUT_PREFIX}%(filepath)s",
@@ -1346,7 +1413,7 @@ class JobManager:
     def __init__(self, runner: YtDlpRunner) -> None:
         self.runner = runner
         self._jobs: "collections.OrderedDict[str, dict[str, Any]]" = collections.OrderedDict()
-        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._queue: queue.Queue[tuple[str, int] | None] = queue.Queue()
         self._lock = threading.RLock()
         self._revision = 0
         self._active_job_id: str | None = None
@@ -1377,8 +1444,9 @@ class JobManager:
                 ) from exc
             self._jobs[job_id] = job
             self._touch(job)
+            generation = int(job["_queue_generation"])
             snapshot = self._public_job(job)
-        self._queue.put(job_id)
+        self._queue.put((job_id, generation))
         return snapshot
 
     def list_jobs(self) -> dict[str, Any]:
@@ -1405,6 +1473,7 @@ class JobManager:
                 return self._public_job(job)
             job["cancel_requested"] = True
             if job["status"] == "queued":
+                job["_queue_generation"] = int(job.get("_queue_generation", 0)) + 1
                 self._set_terminal(job, "cancelled", "Paused")
             elif self._active_job_id == job_id:
                 job["phase"] = "Pausing…"
@@ -1431,6 +1500,18 @@ class JobManager:
                 )
             options = dict(job["options"])
             options.update(network_options)
+            try:
+                self._save_recovery_manifest({**job, "options": options})
+            except OSError as exc:
+                job["status"] = "interrupted"
+                job["phase"] = "Recovery record could not be updated"
+                self._touch(job)
+                raise BridgeError(
+                    "Could not update the download recovery record.",
+                    code="recovery_write_failed",
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    details={"reason": clean_text(exc, 400)},
+                ) from exc
             job["options"] = options
             job["status"] = "queued"
             job["phase"] = "Waiting to resume"
@@ -1446,22 +1527,14 @@ class JobManager:
             job["_speed_last_downloaded_bytes"] = None
             job["_speed_accumulated_bytes"] = 0.0
             job["_stream_index"] = 0
+            job["_stream_id"] = None
             job["_stream_last_downloaded"] = None
+            job["_queue_generation"] = int(job.get("_queue_generation", 0)) + 1
+            generation = int(job["_queue_generation"])
             job["logs"].append("[bridge] Resume requested; yt-dlp will continue compatible partial files.")
-            try:
-                self._save_recovery_manifest(job)
-            except OSError as exc:
-                job["status"] = "interrupted"
-                job["phase"] = "Recovery record could not be updated"
-                raise BridgeError(
-                    "Could not update the download recovery record.",
-                    code="recovery_write_failed",
-                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    details={"reason": clean_text(exc, 400)},
-                ) from exc
             self._touch(job)
             snapshot = self._public_job(job)
-        self._queue.put(job_id)
+        self._queue.put((job_id, generation))
         return snapshot
 
     def forget(self, job_id: str) -> bool:
@@ -1544,8 +1617,15 @@ class JobManager:
             "_speed_accumulated_bytes": 0.0,
             "_stream_count": expected_stream_count(options["download_mode"], options["selection"]),
             "_stream_weights": list(options.get("expected_bytes") or []) or None,
+            "_stream_ids": (
+                [options["selection"]["video_format_id"], options["selection"]["audio_format_id"]]
+                if options["selection"].get("type") == "streams"
+                else None
+            ),
+            "_stream_id": None,
             "_stream_index": 0,
             "_stream_last_downloaded": None,
+            "_queue_generation": 0,
             "_cookies_rejected": False,
             "options": dict(options),
         }
@@ -1683,11 +1763,12 @@ class JobManager:
 
     def _worker_loop(self) -> None:
         while not self._stopping:
-            job_id = self._queue.get()
-            if job_id is None:
+            item = self._queue.get()
+            if item is None:
                 return
+            job_id, generation = item
             try:
-                self._run_job(job_id)
+                self._run_job(job_id, generation)
             except Exception as exc:  # Keep the queue alive after unexpected failures.
                 with self._lock:
                     job = self._jobs.get(job_id)
@@ -1696,10 +1777,15 @@ class JobManager:
                         job["error"] = clean_text(exc, 800)
                         self._set_terminal(job, "failed", "Bridge error")
 
-    def _run_job(self, job_id: str) -> None:
+    def _run_job(self, job_id: str, generation: int) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job is None or job["status"] in TERMINAL_STATUSES or job["cancel_requested"]:
+            if (
+                job is None
+                or job["status"] in TERMINAL_STATUSES
+                or job["cancel_requested"]
+                or int(job.get("_queue_generation", 0)) != generation
+            ):
                 return
             job["started_at"] = utc_now()
             self._active_job_id = job_id
@@ -1726,6 +1812,7 @@ class JobManager:
                     job["_speed_last_downloaded_bytes"] = None
                     job["_speed_accumulated_bytes"] = 0.0
                     job["_stream_index"] = 0
+                    job["_stream_id"] = None
                     job["_stream_last_downloaded"] = None
                     job["_cookies_rejected"] = False
                     self._touch(job)
@@ -1742,6 +1829,7 @@ class JobManager:
                         self._set_terminal(job, "cancelled", "Paused")
                         return
                     if return_code == 0:
+                        job["error"] = None
                         job["progress"]["percent"] = 100.0
                         self._set_terminal(job, "completed", "Complete")
                         return
@@ -1822,16 +1910,25 @@ class JobManager:
         try:
             assert process.stdout is not None
             for raw_line in process.stdout:
-                line = clean_text(redact_proxy_reference(raw_line, options.get("proxy_url")), 4000)
+                cleaned_raw = clean_text(raw_line, 4000)
+                if not cleaned_raw:
+                    continue
+                is_progress = cleaned_raw.startswith(PROGRESS_PREFIX)
+                is_output = cleaned_raw.startswith(OUTPUT_PREFIX)
+                line = (
+                    cleaned_raw
+                    if (is_progress or is_output)
+                    else clean_text(redact_proxy_reference(raw_line, options.get("proxy_url")), 4000)
+                )
                 if not line:
                     continue
                 with self._lock:
                     job = self._jobs.get(job_id)
                     if job is None:
                         continue
-                    if line.startswith(PROGRESS_PREFIX):
+                    if is_progress:
                         self._consume_progress(job, line[len(PROGRESS_PREFIX) :])
-                    elif line.startswith(OUTPUT_PREFIX):
+                    elif is_output:
                         job["output_path"] = clean_text(line[len(OUTPUT_PREFIX) :], 1800)
                         self._touch(job)
                     elif COOKIES_REJECTED_MARKER in line.lower():
@@ -1896,7 +1993,8 @@ class JobManager:
 
     def _consume_progress(self, job: dict[str, Any], payload: str) -> None:
         values = payload.split("|")
-        values.extend(["NA"] * (7 - len(values)))
+        if len(values) < 8:
+            values.extend(["NA"] * (8 - len(values)))
 
         def number(index: int) -> int | float | None:
             return optional_number(values[index])
@@ -1907,18 +2005,29 @@ class JobManager:
         eta = number(4)
         fragment_index = number(5)
         fragment_count = number(6)
+        raw_stream_id = values[7].strip()
+        stream_id = raw_stream_id if raw_stream_id and raw_stream_id.upper() != "NA" else ""
 
         # yt-dlp restarts downloaded_bytes for each media file, so a merge job used
-        # to fill the bar once per stream. Detect that restart, then spread the bar
-        # across the streams this job will download, weighted by their real sizes
-        # when the panel supplied them.
-        if downloaded is not None:
+        # to fill the bar once per stream. Prefer the reported format_id when
+        # available (which also handles resuming directly on stream 2 and small
+        # video streams), falling back to byte-counter restarts otherwise.
+        max_index = max(0, int(job.get("_stream_count") or 1) - 1)
+        if stream_id:
+            known_ids = job.get("_stream_ids")
+            if isinstance(known_ids, list) and stream_id in known_ids:
+                job["_stream_index"] = min(known_ids.index(stream_id), max_index)
+            else:
+                previous_stream_id = job.get("_stream_id")
+                if previous_stream_id is not None and stream_id != previous_stream_id:
+                    job["_stream_index"] = min(int(job.get("_stream_index") or 0) + 1, max_index)
+            job["_stream_id"] = stream_id
+            if downloaded is not None:
+                job["_stream_last_downloaded"] = float(downloaded)
+        elif downloaded is not None:
             previous = job.get("_stream_last_downloaded")
             if previous is not None and float(downloaded) < float(previous) - 1:
-                job["_stream_index"] = min(
-                    int(job.get("_stream_index") or 0) + 1,
-                    max(0, int(job.get("_stream_count") or 1) - 1),
-                )
+                job["_stream_index"] = min(int(job.get("_stream_index") or 0) + 1, max_index)
             job["_stream_last_downloaded"] = float(downloaded)
 
         stream_fraction = 0.0
@@ -2025,7 +2134,11 @@ class JobManager:
             return
         try:
             if os.name == "nt":
-                process.terminate()
+                try:
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                except (OSError, ValueError):
+                    YtDlpRunner._kill_windows_tree(process)
+                    return
             else:
                 os.killpg(process.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
@@ -2036,7 +2149,7 @@ class JobManager:
             if process.poll() is None:
                 try:
                     if os.name == "nt":
-                        process.kill()
+                        YtDlpRunner._kill_windows_tree(process)
                     else:
                         os.killpg(process.pid, signal.SIGKILL)
                 except (OSError, ProcessLookupError):
@@ -2129,7 +2242,20 @@ def origin_allowed(origin: str | None) -> bool:
         parsed = urllib.parse.urlsplit(origin)
     except ValueError:
         return False
-    return parsed.scheme == "https" and (parsed.hostname or "").lower() in VIDEO_HOSTS
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and (parsed.hostname or "").lower() in VIDEO_HOSTS
+        and port is None
+        and not parsed.username
+        and not parsed.password
+        and parsed.path == ""
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 class BridgeHTTPServer(ThreadingHTTPServer):
@@ -2155,6 +2281,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
     # Close idle keep-alive connections instead of pinning a thread forever. The
     # panel polls at most every 9 seconds, so a live tab always reuses its socket.
     timeout = IDLE_CONNECTION_TIMEOUT
+
+    def parse_request(self) -> bool:
+        self._body_consumed = False
+        return super().parse_request()
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write(f"[{self.log_date_time_string()}] {self.client_address[0]} {fmt % args}\n")
@@ -2218,13 +2348,15 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 return
             self._require_auth()
             if path == "/api/v1/health":
+                yt_dlp_version = self.server.runner.version()
+                js_runtime = self.server.runner.javascript_runtime()
                 self._json_response(
                     HTTPStatus.OK,
                     {
                         "service": APP_NAME,
                         "version": APP_VERSION,
                         "api_version": API_VERSION,
-                        "status": "ready",
+                        "status": "ready" if yt_dlp_version != "unavailable" else "unavailable",
                         "capabilities": [
                             "proxy",
                             "invalid_certificates",
@@ -2233,10 +2365,10 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                             "persistent_resume",
                             "cookies_file",
                         ],
-                        "yt_dlp_version": self.server.runner.version(),
+                        "yt_dlp_version": yt_dlp_version,
                         "ffmpeg_available": shutil.which("ffmpeg") is not None,
-                        "javascript_runtime_available": self.server.runner.javascript_runtime() is not None,
-                        "javascript_runtime": self.server.runner.javascript_runtime(),
+                        "javascript_runtime_available": js_runtime is not None,
+                        "javascript_runtime": js_runtime,
                         "download_dir": str(self.server.config.download_dir.expanduser()),
                         "cookies_file_configured": self.server.config.cookies_file is not None,
                         "cookies_file_found": bool(self.server.config.cookies_file and self.server.config.cookies_file.is_file()),
@@ -2311,7 +2443,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self._error_response(BridgeError("Invalid Host header.", code="invalid_host", status=HTTPStatus.FORBIDDEN))
             return False
         origin = self.headers.get("Origin")
-        if (require_origin or origin) and not origin_allowed(origin):
+        if (require_origin and not origin) or (origin and not origin_allowed(origin)):
             self._error_response(BridgeError("Origin is not allowed.", code="origin_denied", status=HTTPStatus.FORBIDDEN))
             return False
         return True
@@ -2363,7 +2495,7 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
             self._drain_body()
         except OSError:
             self.close_connection = True
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
         self.send_response(int(status))
         self._send_common_headers(content_length=len(body), authenticated=authenticated)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -2405,6 +2537,8 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 
 
 def emit_userscript(template: pathlib.Path, output: pathlib.Path, config: BridgeConfig) -> pathlib.Path:
+    if not TOKEN_RE.fullmatch(config.token):
+        raise BridgeError("The configured API token contains invalid characters.", code="config_invalid")
     try:
         source = template.read_text(encoding="utf-8")
     except OSError as exc:
